@@ -498,7 +498,7 @@ Automated via [release-please](https://github.com/googleapis/release-please). No
 
 - **stdout is sacred**: All logging goes to stderr. stdout is exclusively for MCP JSON-RPC protocol messages. Any `console.log` breaks the protocol.
 - Never commit `.env`, `cookies.txt`, or `.arc1.json` (all in `.gitignore`)
-- **`mta.yaml` is gitignored** — it contains personal/environment-specific values (BTP destination names, safety config). Only modify it locally; never `git add mta.yaml` unless explicitly force-added (`git add -f mta.yaml`).
+- **`mta.yaml` is committed; `mta-overrides.mtaext` is gitignored** — The base `mta.yaml` is tracked and ships with placeholder destinations (`your-basic-destination` / `your-pp-destination`) plus safe defaults (writes off, free SQL off, `$TMP` only). Per-landscape values live in `mta-overrides.mtaext` (gitignored — copy from `mta-overrides.mtaext.example`) or any `mta-*.mtaext` file. Deploy with `cf deploy ... -e mta-overrides.mtaext` (or `npm run btp:build-deploy-ext`). The `mta-overrides.mtaext.example` template is tracked so deployers always have a reference.
 - Sensitive fields (password, token, cookie) are redacted in logs
 - CSRF tokens are auto-managed by `src/adt/http.ts` (fetch via HEAD, refresh on 403)
 - **Safety config is the server ceiling** — per-user scopes (JWT) can only restrict further, never expand beyond server config
