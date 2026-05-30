@@ -155,6 +155,113 @@ function tadirObjectUrl(tadirType: string, name: string): string {
   }
 }
 
+// ─── TABLE_QUERY SQL builder ───────────────────────────────────────────────
+
+/** Allowed SQL comparison operators for TABLE_QUERY where conditions. */
+const ALLOWED_OPS = new Set([
+  '=',
+  '!=',
+  '<>',
+  '<',
+  '<=',
+  '>',
+  '>=',
+  'LIKE',
+  'NOT LIKE',
+  'IN',
+  'NOT IN',
+  'IS NULL',
+  'IS NOT NULL',
+]);
+
+// BETWEEN is intentionally excluded: the value would require parsing "low AND high"
+// where AND is a reserved word, making safe escaping complex and error-prone.
+// Use two separate conditions (>= low, <= high) instead.
+
+/**
+ * Build a safe IN/NOT IN list from a comma-separated string of raw values.
+ * Each value is trimmed, single-quote-escaped, and wrapped in quotes.
+ * Surrounding parentheses are accepted for caller convenience but stripped.
+ * Subquery injection is impossible because every element becomes a string literal.
+ */
+function buildInList(raw: string): string {
+  const trimmed = raw.trim();
+  const inner = trimmed.startsWith('(') && trimmed.endsWith(')') ? trimmed.slice(1, -1) : trimmed;
+  const parts = inner.split(',').map((p) => {
+    const escaped = p.trim().replace(/'/g, "''");
+    return `'${escaped}'`;
+  });
+  return `(${parts.join(', ')})`;
+}
+
+/** Upper bound on rows returned by a single TABLE_QUERY — a memory-safety rail (the whole
+ *  result set is buffered in `parseTableContents`), not a SAP-side limit. Page client-side
+ *  for more. Generous on purpose; adjust if a real use case needs it. */
+const MAX_TABLE_QUERY_ROWS = 10_000;
+
+/** Coerce a caller-supplied row limit into a safe positive integer in [1, MAX_TABLE_QUERY_ROWS].
+ *  NaN / non-finite / non-positive / undefined fall back to the default (prevents `rowNumber=NaN`
+ *  and unbounded result buffering). */
+export function clampPreviewRows(requested: number | undefined, fallback = 100): number {
+  if (requested === undefined || !Number.isFinite(requested) || requested < 1) return fallback;
+  return Math.min(Math.floor(requested), MAX_TABLE_QUERY_ROWS);
+}
+
+/** Sanitize a SQL identifier (table / column / field): uppercase, then strip everything but
+ *  word characters and the namespace slash. Throws when nothing survives — a structurally
+ *  invalid identifier must fail closed rather than emit malformed SQL (e.g. `SELECT , X FROM`).
+ *  Stripping spaces is also what blocks keyword injection (UNION/JOIN/OR collapse to one token). */
+function sanitizeIdentifier(raw: string, kind: 'table' | 'column' | 'field'): string {
+  const safe = raw.toUpperCase().replace(/[^\w/]/g, '');
+  if (!safe) throw new Error(`TABLE_QUERY: ${kind} name "${raw}" is invalid (empty after sanitization)`);
+  return safe;
+}
+
+/**
+ * Build a safe SELECT statement from structured parameters.
+ * All identifiers are uppercased, stripped to word-chars + namespace slash, and rejected if empty.
+ * String values are single-quote escaped (doubled single quotes).
+ * IN/NOT IN values are strictly parsed as quoted literal lists (no subqueries).
+ * Raises if the table, any column, or any where-field is empty after sanitization.
+ * ORDER BY is intentionally omitted: the ADT freestyle endpoint rejects it on NW 7.50/7.51.
+ */
+export function buildTableQuerySql(
+  tableName: string,
+  columns?: string[],
+  where?: Array<{ field: string; op: string; value?: string }>,
+): string {
+  const safeTable = sanitizeIdentifier(tableName, 'table');
+
+  const colList = columns && columns.length > 0 ? columns.map((c) => sanitizeIdentifier(c, 'column')).join(', ') : '*';
+
+  let sql = `SELECT ${colList} FROM ${safeTable}`;
+
+  if (where && where.length > 0) {
+    const clauses = where.map(({ field, op, value }) => {
+      const safeField = sanitizeIdentifier(field, 'field');
+      const safeOp = op.trim().toUpperCase();
+      if (!ALLOWED_OPS.has(safeOp)) throw new Error(`TABLE_QUERY: operator "${op}" is not allowed`);
+
+      if (safeOp === 'IS NULL' || safeOp === 'IS NOT NULL') return `${safeField} ${safeOp}`;
+
+      if (safeOp === 'IN' || safeOp === 'NOT IN') {
+        // Each element is individually escaped — subquery injection impossible.
+        const safeList = buildInList(String(value ?? ''));
+        return `${safeField} ${safeOp} ${safeList}`;
+      }
+
+      const escaped = String(value ?? '').replace(/'/g, "''");
+      return `${safeField} ${safeOp} '${escaped}'`;
+    });
+    sql += ` WHERE ${clauses.join(' AND ')}`;
+  }
+
+  // ORDER BY intentionally omitted: the ADT freestyle SQL endpoint rejects it on
+  // NW 7.50/7.51 (parser error: '"DESC" is not allowed here'). Sort client-side if needed.
+
+  return sql;
+}
+
 export class AdtClient {
   readonly http: AdtHttpClient;
   readonly safety: SafetyConfig;
@@ -1114,6 +1221,28 @@ export class AdtClient {
   /** Execute freestyle SQL query */
   async runQuery(sql: string, maxRows = 100): Promise<{ columns: string[]; rows: Record<string, string>[] }> {
     checkOperation(this.safety, OperationType.FreeSQL, 'RunQuery');
+    const resp = await this.http.post(`/sap/bc/adt/datapreview/freestyle?rowNumber=${maxRows}`, sql, 'text/plain');
+    return parseTableContents(resp.body);
+  }
+
+  /**
+   * Query a table or CDS view with structured parameters.
+   * Builds the SELECT server-side from structured params. IN/NOT IN values are strictly
+   * parsed as quoted literal lists (no subqueries). Uses the freestyle endpoint so
+   * multi-column WHERE and CDS views work on all SAP releases.
+   * Gated by allowDataPreview (not allowFreeSQL).
+   */
+  async runTableQuery(
+    tableName: string,
+    opts: {
+      columns?: string[];
+      where?: Array<{ field: string; op: string; value?: string }>;
+      maxRows?: number;
+    } = {},
+  ): Promise<{ columns: string[]; rows: Record<string, string>[] }> {
+    checkOperation(this.safety, OperationType.Query, 'RunTableQuery');
+    const sql = buildTableQuerySql(tableName, opts.columns, opts.where);
+    const maxRows = clampPreviewRows(opts.maxRows);
     const resp = await this.http.post(`/sap/bc/adt/datapreview/freestyle?rowNumber=${maxRows}`, sql, 'text/plain');
     return parseTableContents(resp.body);
   }

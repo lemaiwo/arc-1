@@ -475,6 +475,16 @@ function buildBaseErrorMessage(
         );
       }
     }
+    if (tool === 'SAPRead' && argType === 'TABLE_QUERY' && err.statusCode === 400) {
+      const combined = `${err.message}\n${err.responseBody ?? ''}`;
+      if (/is invalid here|due to grammar/i.test(combined)) {
+        return (
+          `${enriched}\n\nHint: TABLE_QUERY parser error — check field names match the actual column names ` +
+          'exposed by the table/CDS view (use SAPRead(type="DDLS", include="elements") to inspect CDS view fields). ' +
+          'Also verify value formats (e.g. FiscalPeriod is C(2,0) so use "01" not "001").'
+        );
+      }
+    }
     const behaviorPoolHint = getBehaviorPoolSaveFailureHint(err, args);
     if (behaviorPoolHint) {
       return `${enriched}\n\nHint: ${behaviorPoolHint}`;
@@ -1875,6 +1885,15 @@ async function handleSAPRead(
     case 'TABLE_CONTENTS': {
       const maxRows = Number(args.maxRows ?? 100);
       const data = await client.getTableContents(name, maxRows, args.sqlFilter as string | undefined);
+      return textResult(JSON.stringify(data, null, 2));
+    }
+    case 'TABLE_QUERY': {
+      const maxRows = Number(args.maxRows ?? 100);
+      const columns = Array.isArray(args.columns) ? (args.columns as string[]) : undefined;
+      const where = Array.isArray(args.where)
+        ? (args.where as Array<{ field: string; op: string; value?: string }>)
+        : undefined;
+      const data = await client.runTableQuery(name, { columns, where, maxRows });
       return textResult(JSON.stringify(data, null, 2));
     }
     case 'SOBJ': {
