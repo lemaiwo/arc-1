@@ -42,6 +42,60 @@ import type { XsuaaCredentials } from './xsuaa.js';
 // ─── OAuth Callback Proxy Handler (issue #214) ───────────────────────
 
 /**
+ * Minimal HTML-escape for embedding untrusted text (e.g. an OAuth
+ * `error_description` from the query string) into the error page below.
+ */
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/**
+ * Is this a loopback HTTP redirect URI (`http://localhost|127.0.0.1|[::1]`)?
+ * Such callbacks are ephemeral local listeners that native MCP clients (GitHub
+ * Copilot, MCP Inspector) tear down on failure — so on an OAuth error we render
+ * a self-hosted page for them rather than 302-ing to a dead port. Hosted HTTPS
+ * callbacks (claude.ai, Copilot Studio) and custom-scheme app callbacks
+ * (`vscode:`, `cursor:`) are live and expect the spec error redirect, so they
+ * keep getting it.
+ */
+function isLoopbackHttpRedirect(url: URL): boolean {
+  if (url.protocol !== 'http:') return false;
+  const host = url.hostname.toLowerCase();
+  return host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]';
+}
+
+/**
+ * Render a self-hosted OAuth error page for `/oauth/callback`. Surfaces the
+ * IdP's error to the human (loopback MCP clients usually can't — they close
+ * their listener on failure) with an actionable hint for the most common case,
+ * `invalid_scope` (authenticated but no granted scopes → an admin must assign an
+ * ARC-1 role collection under the user's login IdP). `clientReturnUrl` carries
+ * the error + original state for the rare client still listening.
+ */
+function renderOAuthErrorPage(error: string, errorDescription: string, clientReturnUrl: string): string {
+  const hint =
+    error === 'invalid_scope'
+      ? 'You are signed in, but your user is not granted any ARC-1 scopes. An administrator must assign you an ARC-1 role collection (for example "ARC-1 Admin") under the identity provider you sign in with — see the ARC-1 authorization docs.'
+      : 'Retry the sign-in from your MCP client. If it keeps failing, share this error with your ARC-1 administrator.';
+  const descBlock = errorDescription ? `<p><code>${escapeHtml(errorDescription)}</code></p>` : '';
+  return (
+    '<!doctype html><html><head><meta charset="utf-8"><title>ARC-1 sign-in failed</title></head>' +
+    '<body style="font-family:sans-serif;max-width:42rem;margin:3rem auto;padding:0 1rem;line-height:1.5">' +
+    '<h1>ARC-1 sign-in failed</h1>' +
+    `<p><strong>Error:</strong> <code>${escapeHtml(error)}</code></p>` +
+    descBlock +
+    `<p>${escapeHtml(hint)}</p>` +
+    `<p><a href="${escapeHtml(clientReturnUrl)}">Return to your application</a></p>` +
+    '</body></html>'
+  );
+}
+
+/**
  * Express handler for ARC-1's `/oauth/callback`, the second half of the
  * XSUAA callback proxy that fixes the `+`-in-state bug (issue #214).
  *
@@ -85,25 +139,51 @@ export function createOAuthCallbackHandler(stateCodec: OAuthStateCodec) {
       return;
     }
 
-    // Forward either the error or the authorization code to the client,
-    // re-attaching the client's ORIGINAL state. URLSearchParams serialization
-    // encodes `+` as `%2B`, which is exactly what fixes the round-trip.
+    // On error there is no auth code. Forward the error to the client per the
+    // OAuth spec — EXCEPT for loopback HTTP callbacks. Native MCP clients
+    // (GitHub Copilot, MCP Inspector, …) tear down their ephemeral localhost
+    // listener the instant the flow fails, so a 302 there lands on a dead port
+    // and the user sees a blank ERR_CONNECTION_REFUSED with no clue why. For
+    // those we render a self-hosted page that surfaces the real reason (e.g.
+    // invalid_scope → missing role collection), with a best-effort link back.
+    // Hosted HTTPS callbacks (claude.ai, Copilot Studio) and custom-scheme app
+    // callbacks (vscode:, cursor:) are live and expect the redirect, so they
+    // keep getting it.
     const error = typeof req.query.error === 'string' ? req.query.error : undefined;
     if (error) {
+      const errorDescription = typeof req.query.error_description === 'string' ? req.query.error_description : '';
+      if (decoded.clientState !== undefined) target.searchParams.set('state', decoded.clientState);
       target.searchParams.set('error', error);
-      const errDesc = req.query.error_description;
-      if (typeof errDesc === 'string') target.searchParams.set('error_description', errDesc);
-    } else {
-      const code = typeof req.query.code === 'string' ? req.query.code : '';
-      target.searchParams.set('code', code);
+      if (errorDescription) target.searchParams.set('error_description', errorDescription);
+      const loopback = isLoopbackHttpRedirect(target);
+      logger.warn('OAuth callback: identity provider returned an error', {
+        error,
+        errorDescriptionPreview: errorDescription.slice(0, 200),
+        clientRedirectUriHost: target.host,
+        loopback,
+      });
+      if (loopback) {
+        res
+          .status(400)
+          .type('html')
+          .send(renderOAuthErrorPage(error, errorDescription, target.toString()));
+      } else {
+        res.redirect(302, target.toString());
+      }
+      return;
     }
+
+    // Success: forward the authorization code, re-attaching the client's
+    // ORIGINAL state. URLSearchParams serialization encodes `+` as `%2B`, which
+    // is exactly what fixes the round-trip (issue #214).
+    const code = typeof req.query.code === 'string' ? req.query.code : '';
+    target.searchParams.set('code', code);
     if (decoded.clientState !== undefined) {
       target.searchParams.set('state', decoded.clientState);
     }
 
     logger.debug('OAuth callback: redirecting to client', {
       clientRedirectUriHost: target.host,
-      hasError: !!error,
       hasState: decoded.clientState !== undefined,
     });
     res.redirect(302, target.toString());
