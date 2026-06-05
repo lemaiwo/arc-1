@@ -23,7 +23,7 @@
 
 import { readFileSync } from 'node:fs';
 import { Config, Version } from '@abaplint/core';
-import { mapSapReleaseToAbaplintVersion } from '../adt/features.js';
+import { isBeyondAbaplintCeiling, mapSapReleaseToAbaplintVersion } from '../adt/features.js';
 import type { SystemType } from '../adt/types.js';
 import { CLOUD_DISABLED_RULES, CLOUD_ERROR_RULES, CLOUD_WARNING_RULES } from './presets/cloud.js';
 import { ONPREM_DISABLED_RULES, ONPREM_ERROR_RULES, ONPREM_WARNING_RULES } from './presets/onprem.js';
@@ -61,6 +61,17 @@ export function buildLintConfig(options: LintConfigOptions = {}): Config {
   const preset = options.systemType === 'btp' ? 'cloud' : 'onprem';
   applyPreset(raw, preset);
 
+  // On releases newer than abaplint's grammar (e.g. SAP_BASIS 816), abaplint cannot parse
+  // legitimate new syntax and reports false-positive parse errors. Demote them to warnings so
+  // standalone lint doesn't mislabel valid new-syntax source as broken (matches buildPreWriteConfig).
+  // Applied before user config/overrides so an explicit user severity still wins.
+  if (isBeyondAbaplintCeiling(options.abapRelease)) {
+    applyRuleOverrides(raw, {
+      parser_error: { severity: 'Warning' },
+      cds_parser_error: { severity: 'Warning' },
+    });
+  }
+
   // Apply user config file (if provided)
   if (options.configFile) {
     applyConfigFile(raw, options.configFile);
@@ -90,15 +101,22 @@ export function buildPreWriteConfig(options: LintConfigOptions = {}): Config {
     rules[key] = false;
   }
 
+  // On releases newer than abaplint's parser grammar (e.g. ABAP Platform 2025 = 816),
+  // abaplint cannot parse legitimate new syntax (CDS `define table entity`,
+  // `READ TABLE ... WHERE`, RAP keywords, ...) and emits false-positive parse errors.
+  // Demote them to non-blocking warnings so the write proceeds (SAP-side activation is the
+  // definitive syntax check). Genuine parse errors on supported releases still block.
+  const parserSeverity: 'Error' | 'Warning' = isBeyondAbaplintCeiling(options.abapRelease) ? 'Warning' : 'Error';
+
   // Enable only pre-write blocking rules
   const preWriteRules: RuleOverrides = {
-    parser_error: { severity: 'Error' },
+    parser_error: { severity: parserSeverity },
     parser_missing_space: { severity: 'Error' },
     begin_end_names: { severity: 'Error' },
     unreachable_code: { severity: 'Error' },
     identical_conditions: { severity: 'Error' },
     // CDS syntax errors (catches missing commas, wrong keywords, invalid DDL constructs)
-    cds_parser_error: { severity: 'Error' },
+    cds_parser_error: { severity: parserSeverity },
   };
 
   // Add cloud-specific blocking rules

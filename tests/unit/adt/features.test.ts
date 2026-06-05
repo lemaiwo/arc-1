@@ -3,11 +3,13 @@ import { describe, expect, it, vi } from 'vitest';
 import type { FeatureConfig } from '../../../src/adt/config.js';
 import { AdtApiError } from '../../../src/adt/errors.js';
 import {
+  ABAPLINT_MAX_RELEASE,
   classifyAuthProbeError,
   classifyFeatureProbeStatus,
   detectHanaFromComponents,
   detectHanaFromDiscovery,
   detectSystemType,
+  isBeyondAbaplintCeiling,
   mapSapReleaseToAbaplintVersion,
   probeAuthorization,
   probeFeatures,
@@ -227,6 +229,36 @@ describe('Feature Detection', () => {
       expect(mapSapReleaseToAbaplintVersion('710')).toBe(Version.v702);
       // 745 is between 740 and 750, should map to v740sp02
       expect(mapSapReleaseToAbaplintVersion('745')).toBe(Version.v740sp02);
+    });
+  });
+
+  describe('isBeyondAbaplintCeiling', () => {
+    it('is false at/below abaplint ceiling (758)', () => {
+      expect(ABAPLINT_MAX_RELEASE).toBe(758);
+      expect(isBeyondAbaplintCeiling('758')).toBe(false);
+      expect(isBeyondAbaplintCeiling('757')).toBe(false);
+      expect(isBeyondAbaplintCeiling('750')).toBe(false);
+    });
+
+    it('is true for the 8xx scheme (816 = ABAP Platform 2025) and any release > 758', () => {
+      expect(isBeyondAbaplintCeiling('816')).toBe(true);
+      expect(isBeyondAbaplintCeiling('759')).toBe(true);
+      expect(isBeyondAbaplintCeiling('800')).toBe(true);
+    });
+
+    it('is false for unknown / non-numeric / empty input (never demote on missing data)', () => {
+      expect(isBeyondAbaplintCeiling(undefined)).toBe(false);
+      expect(isBeyondAbaplintCeiling('')).toBe(false);
+      expect(isBeyondAbaplintCeiling('sap_btp')).toBe(false);
+    });
+
+    it('stays in sync with the mapSapReleaseToAbaplintVersion ceiling (coupling guard)', () => {
+      // ABAPLINT_MAX_RELEASE is the point above which the abaplint version stops increasing.
+      // If someone adds a newer grammar (e.g. >= 759 → v759) without bumping ABAPLINT_MAX_RELEASE,
+      // this fails — forcing both to move together.
+      const ceilingVersion = mapSapReleaseToAbaplintVersion(String(ABAPLINT_MAX_RELEASE));
+      expect(mapSapReleaseToAbaplintVersion(String(ABAPLINT_MAX_RELEASE + 1))).toBe(ceilingVersion);
+      expect(mapSapReleaseToAbaplintVersion('816')).toBe(ceilingVersion);
     });
   });
 

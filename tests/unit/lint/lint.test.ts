@@ -1,5 +1,6 @@
 import { Config, Version } from '@abaplint/core';
 import { describe, expect, it } from 'vitest';
+import { buildLintConfig } from '../../../src/lint/config-builder.js';
 import { detectFilename, lintAbapSource, validateBeforeWrite } from '../../../src/lint/lint.js';
 
 describe('ABAP Lint', () => {
@@ -213,6 +214,77 @@ define view ZI_TEST as select from ztable {
       const result = validateBeforeWrite(source, 'zi_test.ddls.asddls');
       expect(result.pass).toBe(false);
       expect(result.errors.some((e) => e.rule === 'cds_parser_error')).toBe(true);
+    });
+  });
+
+  describe('validateBeforeWrite — 8xx releases beyond abaplint ceiling demote parse errors', () => {
+    // ABAP Platform 2025 (SAP_BASIS 816) introduces syntax abaplint's v758 grammar cannot
+    // parse (CDS `define table entity`, `READ TABLE ... WHERE`, ...). On such releases the
+    // parse error must NOT block the write — it is demoted to a non-blocking warning and
+    // SAP-side activation becomes the definitive syntax check. On supported releases (<=758)
+    // it still blocks, so genuine syntax errors are still caught pre-write.
+    const tableEntity = `define table entity ZTE_TEST {
+  key id : abap.int4;
+  name : abap.char(30);
+}`;
+    const readTableWhere = `CLASS zcl_t DEFINITION PUBLIC.
+  PUBLIC SECTION.
+    METHODS m.
+ENDCLASS.
+CLASS zcl_t IMPLEMENTATION.
+  METHOD m.
+    DATA itab TYPE TABLE OF i.
+    READ TABLE itab INTO DATA(x) WHERE table_line > 2.
+  ENDMETHOD.
+ENDCLASS.`;
+
+    it('does NOT block a CDS table entity on release 816 (cds_parser_error demoted to warning)', () => {
+      const result = validateBeforeWrite(tableEntity, 'zte_test.ddls.asddls', {
+        abapRelease: '816',
+        systemType: 'onprem',
+      });
+      expect(result.pass).toBe(true);
+      expect(result.errors).toHaveLength(0);
+      expect(result.warnings.find((w) => w.rule === 'cds_parser_error')?.severity).toBe('warning');
+    });
+
+    it('still blocks a CDS parse error on a supported release (758)', () => {
+      const result = validateBeforeWrite(tableEntity, 'zte_test.ddls.asddls', {
+        abapRelease: '758',
+        systemType: 'onprem',
+      });
+      expect(result.pass).toBe(false);
+      expect(result.errors.some((e) => e.rule === 'cds_parser_error')).toBe(true);
+    });
+
+    it('does NOT block new ABAP syntax (READ TABLE ... WHERE) on release 816', () => {
+      const result = validateBeforeWrite(readTableWhere, 'zcl_t.clas.abap', {
+        abapRelease: '816',
+        systemType: 'onprem',
+      });
+      expect(result.pass).toBe(true);
+      expect(result.warnings.some((w) => w.rule === 'parser_error')).toBe(true);
+    });
+
+    it('still blocks an ABAP parser error on a supported release (758)', () => {
+      const result = validateBeforeWrite(readTableWhere, 'zcl_t.clas.abap', {
+        abapRelease: '758',
+        systemType: 'onprem',
+      });
+      expect(result.pass).toBe(false);
+      expect(result.errors.some((e) => e.rule === 'parser_error')).toBe(true);
+    });
+
+    it('standalone lint (buildLintConfig) demotes parser_error to warning on 816', () => {
+      const cfg = buildLintConfig({ abapRelease: '816', systemType: 'onprem' });
+      const parserIssue = lintAbapSource(readTableWhere, 'zcl_t.clas.abap', cfg).find((x) => x.rule === 'parser_error');
+      expect(parserIssue?.severity).toBe('warning');
+    });
+
+    it('standalone lint keeps parser_error as error on a supported release (758)', () => {
+      const cfg = buildLintConfig({ abapRelease: '758', systemType: 'onprem' });
+      const parserIssue = lintAbapSource(readTableWhere, 'zcl_t.clas.abap', cfg).find((x) => x.rule === 'parser_error');
+      expect(parserIssue?.severity).toBe('error');
     });
   });
 
