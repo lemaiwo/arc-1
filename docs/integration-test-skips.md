@@ -90,6 +90,7 @@ ARC-1 originally posted DTEL create/update with `Content-Type: application/vnd.s
 | Skip message fragment | Affected tests | Typical on | Should NOT skip on |
 |---|---|---|---|
 | `BACKEND_UNSUPPORTED: lock-handle session correlation differs on this release` | `crud.lifecycle.integration.test.ts` full PROG lifecycle, DTEL CRUD update step, RAP write + SKTD + MSAG on E2E | NW < 7.51 without the `abapfs_extensions` enhancement | NW ≥ 7.51, or any release with `abapfs_extensions` installed |
+| `Backend instability on this SAP system: ADT lock/unlock endpoint intermittently unreachable during write session handling` | Default E2E live write lifecycles that call ADT `_action=LOCK` or `_action=UNLOCK` for package, DDIC, PROG, MSAG, FUGR/FUNC, SKTD, or class-section mutations | Shared/trial SAP systems when ADT session routing temporarily returns HTTP 400 `Service cannot be reached` | Any system where this appears persistently across repeated runs; investigate SICF/ADT routing and stale locks |
 
 ### Root cause: persistent lock-handle 423 after successful LOCK
 
@@ -143,7 +144,7 @@ A quick sanity-check for "is my run healthy?":
 |---|---|---|
 | **NW 7.50 trial** (e.g. `npl.marianzeis.de`) | ~120 / 207 tests | Cat 1 (S/4 demo), Cat 2 (release gap), Cat 3 (trial quirks) |
 | **S/4HANA 2023** (e.g. `a4h.marianzeis.de`) | ~40 / 207 tests | Cat 5 (no transport package), Cat 6 (abapGit/gCTS not installed), some Cat 4 |
-| **ABAP Platform 2025** (SAP_BASIS 816, e.g. `a4h-2025.marianzeis.de`) | ≈ S/4HANA 2023 profile (reads), + see note | Reads + release detection fully validated (full RAP/CDS surface, `adt.integration` 97/114). Cat 6 (abapGit ADT bridge **not installed** on the 2025 trial → SAPGit tests skip). **Note:** the as-migrated 2025 container is *not* perf-tuned like 2023 — concurrent write+activate (DDLS/TABL) intermittently hits ABAP `STACK_TRACE_ERROR` short-dumps + 30 s timeouts. The same tests pass on the tuned 2023 box; tune `rdisp/wp_no_dia` + ICM threads (see `INFRASTRUCTURE.md`) before using 2025 as a write/activate CI target. |
+| **ABAP Platform 2025** (SAP_BASIS 816, e.g. `a4h-2025.marianzeis.de`) | ~54 / 262 default-profile tests | Reads, release detection, write+activate, and CRUD lifecycle are validated on the tuned 2025 trial. Cat 6 dominates where optional backends are absent: the abapGit ADT bridge is **not installed** on the 2025 trial, so SAPGit tests skip. Local 2026-06-06 default-profile baseline: 208 passed / 54 skipped. |
 | **BTP ABAP (cloud)** | ~80 / 207 tests | Cat 1 (no /DMO), Cat 2 (DDIC changes on cloud), Cat 5 (policy) |
 
 Large deviations from these counts on a given system are the signal. If an S/4HANA box suddenly skips 120+ tests, something broke in fixture sync or auth — the matrix helps identify which category lit up.
@@ -184,10 +185,10 @@ Several SAPRead types return a human-readable placeholder (not an MCP error) whe
 |---|---|---|
 | **NW 7.50 trial** | ~50 / 122 tests | Cat 2 (release gap), Cat 3 (lock-handle 423), E2E-α (fixture sync partial), Cat 1 (/DMO missing) |
 | **S/4HANA 2023** | 3 / 122 tests | Cat 5 (no transport package / `--allow-git-writes`) |
-| **ABAP Platform 2025** (SAP_BASIS 816) | ≈ S/4HANA 2023 profile | Cat 5 + abapGit ADT bridge absent on the trial (SAPGit tests skip) |
+| **ABAP Platform 2025** (SAP_BASIS 816) | 4 / 141 default-profile tests when stable | Cat 5 + abapGit ADT bridge absent on the trial (SAPGit tests skip). Local 2026-06-06 default-profile baseline: 137 passed / 4 skipped. A shared ADT write-session routing window can add Cat 3 lock/unlock skips when A4H returns HTTP 400 `Service cannot be reached`; final PR #365 CI validation saw 119 passed / 22 skipped, including 18 such transient routing skips. |
 | **BTP ABAP** | ~30 / 122 tests | Cat 5 (policy), some of Cat 1 |
 
-Anything over ~5 skips on S/4HANA is a regression signal — most likely a broken fixture sync or an unintended breaking change to a SAPRead handler output.
+Anything over ~5 non-transient skips on S/4HANA is a regression signal — most likely a broken fixture sync or an unintended breaking change to a SAPRead handler output. Transient Cat 3 lock/unlock skips should be tracked separately; they indicate SAP ADT routing instability, not missing fixture coverage.
 
 ## Adding a new skip
 

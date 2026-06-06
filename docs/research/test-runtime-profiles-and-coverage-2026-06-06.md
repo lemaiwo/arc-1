@@ -59,7 +59,7 @@ Runtime interpretation:
 - Local default E2E dropped from the original audit's 424.95s all-in profile to 183.22s for the default profile, while preserving the heavier checks in `test:e2e:slow`.
 - Local default integration dropped from the original audit's 320.07s all-in profile to 188.06s for the default profile.
 - The slow E2E profile remains dominated by real SAP backend calls: `BAPIRET2` where-used took 50.3s on A4H 2025, `T000` where-used took 16.2s, and full RAP/SRVB write lifecycles took 111.4s combined.
-- The GitHub default profile is now measured and substantially below the earlier 2026-05-11 run (`integration` 8m01s vs 6m39s on a different system/run, `e2e` 8m55s vs 13m12s). Integration did not improve in GitHub because the default workflow still targets the older 2023 secrets; the next meaningful runtime improvement is the separate 2025 GitHub migration PR.
+- The GitHub default profile is now measured and substantially below the earlier 2026-05-11 run (`integration` 8m01s vs 6m39s on a different system/run, `e2e` 8m55s vs 13m12s). Integration did not improve in PR #364 because that workflow run still targeted the older 2023 secrets. The follow-up PR on branch `codex/github-ci-a4h-2025` addresses this by making `TEST_SAP_*` the single GitHub live SAP target and rotating it to A4H 2025.
 
 ## Sources Checked
 
@@ -231,11 +231,26 @@ GitHub:
 - PR default CI should run `test`, `integration`, `e2e`, and `reliability-summary` using the faster default profiles.
 - If CI fails because of real assertions, fix. If CI exposes SAP transient/time-budget failures, adjust timeouts or profile membership only with evidence.
 
-## Open Follow-Up After This PR
+## Follow-Up Completed: GitHub A4H 2025 Migration
 
-Preparing the 2025 system for GitHub Actions should be a separate PR/change after this one:
+The 2025 system was prepared for GitHub Actions in PR [#365](https://github.com/marianfoo/arc-1/pull/365) on branch `codex/github-ci-a4h-2025`.
 
-- Switch or duplicate GitHub secrets from 2023 to 2025.
-- Verify 2025 HTTP endpoint stability after restarts, including the documented ephemeral-port reservation issue.
-- Run full default CI against 2025 and compare skip/runtime profile against 2023.
-- Decide whether slow profiles should become manual `workflow_dispatch` jobs or a scheduled/nightly workflow.
+- `.github/workflows/test.yml` now uses `TEST_SAP_*` as the one live SAP target for both integration and E2E; E2E maps those values to the `SAP_*` runtime env expected by the local MCP server.
+- Live SAP preflight now fails fast unless the required secrets are present and authenticated ADT core discovery returns HTTP 200. This prevents a green live SAP job caused by an auth skip.
+- Local A4H 2025 preflight on 2026-06-06 returned HTTP 401 unauthenticated and HTTP 200 authenticated against `/sap/bc/adt/core/discovery?sap-client=001`.
+- GitHub `TEST_SAP_*` secrets were rotated to A4H 2025 values on 2026-06-06. Secret values are external state and are not documented here.
+- PR `#365`, Test workflow run `27058553382`, passed with `integration` in 3m50s and `e2e` in 6m26s.
+- Downloaded GitHub artifacts from run `27058553382` reported unit `3,468 passed / 0 skipped`, integration `208 passed / 54 skipped`, and E2E `137 passed / 4 skipped`; required-execution thresholds passed.
+- A later docs push exposed one more reliability issue in Test workflow run `27058886073`: E2E failed on four SAP ADT write-session routing errors, all HTTP 400 `Service cannot be reached` on `_action=LOCK` or `_action=UNLOCK` routes. The existing skip classifier only covered DDIC table unlocks, so this PR generalized that classifier and made default live mutation assertions use the skip-aware helper where appropriate.
+- Test workflow run `27059320564` on commit `4c061709` showed the generalized classifier working (`18` ADT lock/unlock routing skips), and identified one remaining activation-regression custom precondition branch that needed to delegate to the shared classifier.
+- Final Test workflow run `27059551872` on commit `a652aafd` passed: Node 22 unit `3,473 passed / 0 skipped`, Node 24 unit `3,473 passed / 0 skipped`, integration `208 passed / 54 skipped`, and E2E `119 passed / 22 skipped / 0 failed`. The E2E skip increase came from `18` ADT lock/unlock routing-instability skips during that live SAP write-session window.
+- Post-fix local A4H 2025 validation passed: `npm run typecheck`, `npm run lint`, targeted helper unit test (`7` tests), full unit (`3,473` tests), and `npm run test:e2e:full` (`137 passed / 4 skipped`, fixture sync unchanged).
+
+Runtime implication:
+
+| Suite | PR #364 measured GitHub runtime | PR #365 measured GitHub runtime | Result |
+|---|---:|---:|---|
+| integration | 8m01s | 3m50s | The default integration profile now benefits from the tuned 2025 target and stricter preflight. |
+| e2e | 8m55s | 6m26s | The default E2E profile remains sequential but is materially faster on the 2025 target. |
+
+Remaining decision after the 2025 default profile is stable in GitHub: whether `test:integration:slow` and `test:e2e:slow` should become manual `workflow_dispatch` jobs or a scheduled/nightly workflow.
