@@ -353,20 +353,70 @@ export async function releaseTransportRecursive(
   return { released };
 }
 
-/** Delete a transport request */
+/**
+ * Remove a single object from a transport task.
+ *
+ * SAP ADT exposes this as the `removeobject` action on the task URI (atom rel
+ * `http://www.sap.com/cts/relations/removeobject`, "Remove Locked Object"). It MUST be a
+ * PUT — a POST with the same body is accepted (HTTP 200) but silently no-ops. Mirrors the
+ * `changeowner` PUT in `reassignSingle`. Verified live on S/4HANA SAP_BASIS 758 and 816:
+ * clears the lock so a request holding a deleted object's lingering record (lock_status="X")
+ * can then be deleted.
+ *
+ * Release-sensitive — NOT functional on NW 7.5x (verified on 7.50): (1) the 7.50
+ * `CL_ADT_TM_RESOURCE` does not honor `tm:useraction="removeobject"` (the PUT returns
+ * HTTP 400 "User does not exist in the system" — the same `tm:useraction` mishandling
+ * documented for `newrequest` in `createTransport`), and (2) the 7.50 transportorganizer
+ * XML omits `tm:lock_status` entirely, so `parseTransportList` reports `locked:false` and
+ * the `deleteTransport` filter never reaches this call. Net effect on 7.5x: the
+ * `removeLockedObjects` flag is inert and `delete` still fails with the original
+ * "...contains locked objects" (clean such requests in SE09/SE10). No data loss either way.
+ */
+async function removeTransportObject(http: AdtHttpClient, taskId: string, obj: TransportObject): Promise<void> {
+  const body = `<?xml version="1.0" encoding="ASCII"?>
+<tm:root xmlns:tm="${CTS_NAMESPACE_TM}"
+ tm:number="${escapeXmlAttr(taskId)}"
+ tm:useraction="removeobject">
+  <tm:request>
+    <tm:abap_object tm:pgmid="${escapeXmlAttr(obj.pgmid)}" tm:type="${escapeXmlAttr(obj.type)}" tm:name="${escapeXmlAttr(obj.name)}" tm:position="${escapeXmlAttr(obj.position)}" tm:obj_desc="${escapeXmlAttr(obj.description)}"/>
+  </tm:request>
+</tm:root>`;
+
+  await http.put(`/sap/bc/adt/cts/transportrequests/${encodeURIComponent(taskId)}`, body, CTS_CONTENT_TYPE_ORGANIZER, {
+    Accept: CTS_CONTENT_TYPE_ORGANIZER,
+  });
+}
+
+/**
+ * Delete a transport request.
+ *
+ * @param recursive            delete child tasks first, then the parent request.
+ * @param removeLockedObjects  strip locked objects from each task before deleting. ADT refuses to
+ *   delete a request/task that still holds locked objects (HTTP 400 "...contains locked objects") —
+ *   e.g. when a deleted object's record lingers in the task. With this flag ARC-1 removes those
+ *   objects first (the ADT "Remove Locked Object" operation) so the request can be discarded.
+ */
 export async function deleteTransport(
   http: AdtHttpClient,
   safety: SafetyConfig,
   transportId: string,
   recursive = false,
+  removeLockedObjects = false,
 ): Promise<void> {
   checkTransport(safety, transportId, 'DeleteTransport', true);
 
-  if (recursive) {
+  if (recursive || removeLockedObjects) {
     const transport = await getTransport(http, safety, transportId);
     if (transport) {
       for (const task of transport.tasks) {
-        if (task.status !== 'R') {
+        if (task.status === 'R') continue;
+        if (removeLockedObjects) {
+          for (const obj of task.objects.filter((o) => o.locked)) {
+            checkTransport(safety, task.id, 'RemoveTransportObject', true);
+            await removeTransportObject(http, task.id, obj);
+          }
+        }
+        if (recursive) {
           checkTransport(safety, task.id, 'DeleteTransport', true);
           await http.delete(`/sap/bc/adt/cts/transportrequests/${encodeURIComponent(task.id)}`);
         }
@@ -622,6 +672,10 @@ function parseTransportList(xml: string): TransportRequest[] {
 
   return requests.map((req) => {
     const tasks: TransportTask[] = findDeepNodes(req, 'task').map((t) => {
+      // Objects are collected per <task>. The ADT transportorganizer XML nests <abap_object>
+      // under <task>, not directly under <request>, so request-level entries (rare, e.g. some
+      // non-workbench request shapes) are not represented here — which is why `removeLockedObjects`
+      // in deleteTransport iterates tasks. `tm:lock_status` is "X" when locked; absent on NW 7.5x.
       const objects: TransportObject[] = findDeepNodes(t, 'abap_object').map((o) => ({
         pgmid: String(o['@_pgmid'] ?? ''),
         type: String(o['@_type'] ?? ''),

@@ -858,7 +858,10 @@ export const SAPTransportSchema = z.object({
   status: z.string().optional(),
   type: z.string().optional(),
   owner: z.string().optional(),
-  recursive: z.boolean().optional(),
+  // looseOptionalBoolean (not z.boolean()) so GPT/OpenAI clients sending stringified
+  // "true"/"false" coerce instead of erroring at validation (CLAUDE.md boolean guidance).
+  recursive: looseOptionalBoolean,
+  removeLockedObjects: looseOptionalBoolean,
 });
 
 // ─── SAPGit ─────────────────────────────────────────────────────────
