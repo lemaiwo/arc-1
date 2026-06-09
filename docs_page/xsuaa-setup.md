@@ -235,6 +235,54 @@ After this sequence:
 
 This is the only operation that invalidates DCR state. Routine restarts (`cf restart`, `cf push` without rebind, cell moves) no longer disrupt clients.
 
+### Recovering a stuck client
+
+After a client has been connected for a while it can fail with one of two errors. They look alike but invalidate **different things, so they have different fixes**:
+
+| Error | What's stale | Cached token still works? | Fix |
+|-------|--------------|---------------------------|-----|
+| `invalid_token` / "not a valid XSUAA, OIDC, or API key token" | the **access token** | no — it expired | **restart the client** — a cold start re-runs auth |
+| `invalid_client` / `Invalid client_id` | the **DCR registration** | usually yes — so tool calls keep working | **clear the cached registration** — a restart alone won't, because the client keeps using its still-valid token and never re-registers |
+
+**Prevent both:** for `invalid_client`, set a stable [`ARC1_DCR_SIGNING_SECRET`](#stable-dcr-signing-key-recommended) + `ARC1_OAUTH_DCR_TTL_SECONDS=0` so a redeploy can't rotate the signing key. For `invalid_token`, the default `refresh-token-validity` in `xs-security.json` is **30 days**, so idle sessions survive far longer.
+
+**Most clients self-heal** — Claude Desktop, VS Code's MCP client, and MCP Inspector refresh and re-register on their own and rarely surface either error. The two that need a manual nudge are **Eclipse GitHub Copilot** and **Cursor** (Eclipse has no per-server "restart MCP" / re-auth action yet — [copilot-for-eclipse#237](https://github.com/microsoft/copilot-for-eclipse/issues/237)).
+
+#### Eclipse GitHub Copilot
+
+**For `invalid_token`** (an expired or long-idle session — you're effectively logged out): **quit and reopen Eclipse**. On the cold start it re-runs the sign-in — its *"… wants to authenticate"* dialog appears — and you're back.
+
+**For `invalid_client`** (the server's signing key rotated, e.g. an MTA `cf deploy`): **a restart usually won't help** — Copilot keeps using its still-valid access token and never re-registers, so the stale `client_id` only resurfaces on the next forced sign-in. You have to clear its cached registration so it calls `/register` again. **Quit Eclipse**, then delete its one cache file:
+
+```bash
+# macOS / Linux — clears cached MCP logins; you re-authorize each server once
+rm ~/.config/github-copilot/copilot-eclipse.db
+```
+```powershell
+# Windows (PowerShell)
+Remove-Item "$env:LOCALAPPDATA\github-copilot\copilot-eclipse.db"
+```
+
+Reopen Eclipse → use the server → it registers fresh and prompts you to sign in. Deleting the file is low-impact:
+
+- ✅ The only cost: re-authorize your MCP server(s) once (a browser sign-in each).
+- ❌ It does **not** sign you out of GitHub Copilot itself — that's a separate `auth.db`.
+- ❌ It does **not** touch your code, workspaces, Eclipse preferences, or your MCP server list — only cached MCP auth.
+
+> Want to keep your *other* MCP servers signed in? With the `sqlite3` CLI, delete only this server's rows (the cache is keyed by server URL):
+> ```bash
+> sqlite3 ~/.config/github-copilot/copilot-eclipse.db \
+>   "DELETE FROM state WHERE key LIKE 'dynamicAuthProvider:%your-app.cfapps%';"
+> ```
+
+> Sanity check: a healthy ARC-1 `client_id` looks like `arc1-eyJ2Ijox…` (~280+ chars). A short `arc1-<8 hex>` id predates the stateless store and is always rejected — clear it the same way.
+
+#### Cursor
+
+Cursor also caches its registration and may not re-register on `invalid_client`. Reset it by **removing the MCP server entry, restarting Cursor, then re-adding it**. With the stable signing key set (above), you only ever do this once.
+
+> **Found an easier way to recover an Eclipse or Cursor MCP login?** MCP-client behavior is still evolving — please [open an issue or PR](https://github.com/marianfoo/arc-1/issues/new) so these docs can capture the simplest known fix.
+
 ### Browser-based DCR clients (rare)
 
 The four MCP clients in the section above (Claude Desktop, Cursor, MCP Inspector, Copilot Studio) all run as native processes — they call `/register` and `/authorize` over native HTTP, not the browser `fetch` API, and never trigger CORS. If a browser-based MCP client (custom playground, embedded widget) calls these OAuth endpoints from a different origin, you must add that origin to `ARC1_ALLOWED_ORIGINS`. See [Security headers & CORS](security-guide.md#cors-for-browser-based-mcp-clients-opt-in) for the full configuration.
