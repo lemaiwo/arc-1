@@ -11,6 +11,7 @@
  */
 
 import type { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { bareObjectName } from '../helpers/test-prefixes.js';
 import { PERSISTENT_OBJECTS, readFixture } from './fixtures.js';
 import { callTool, type ToolResult } from './helpers.js';
 
@@ -94,17 +95,7 @@ export async function syncPersistentFixtures(client: Client): Promise<FixtureSyn
 
     if (!hasExpectedType && existingTypes.length === 0) {
       console.log(`    [setup] ${label}: missing -> creating from ${obj.fixture}`);
-      try {
-        await createObjectFromFixture(client, obj);
-        await activateObject(client, obj.type, obj.name);
-        summary.created.push(label);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        const reason = classifyFixtureError(msg);
-        if (reason === null) throw err;
-        console.warn(`    [setup] ${label}: skipping — ${reason}`);
-        summary.skipped.push({ label, reason });
-      }
+      await createActivateOrReconcile(client, obj, desiredSource, summary, verifiedActiveSources, 'create');
       continue;
     }
 
@@ -135,17 +126,7 @@ export async function syncPersistentFixtures(client: Client): Promise<FixtureSyn
     }
 
     console.log(`    [setup] ${label}: recreating from ${obj.fixture}`);
-    try {
-      await createObjectFromFixture(client, obj);
-      await activateObject(client, obj.type, obj.name);
-      summary.recreated.push(label);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      const reason = classifyFixtureError(msg);
-      if (reason === null) throw err;
-      console.warn(`    [setup] ${label}: skipping recreate — ${reason}`);
-      summary.skipped.push({ label, reason });
-    }
+    await createActivateOrReconcile(client, obj, desiredSource, summary, verifiedActiveSources, 'recreate');
   }
 
   await assertSyncedFixturesActive(client, summary, verifiedActiveSources);
@@ -198,6 +179,107 @@ async function createObjectFromFixture(client: Client, obj: PersistentObject): P
 async function activateObject(client: Client, type: string, name: string): Promise<void> {
   const activateResult = await callTool(client, 'SAPActivate', { type, name });
   assertToolSuccess(activateResult, `activate ${type} ${name}`);
+}
+
+const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Create + activate a fixture, tolerating a concurrent run that produced the
+ * same object microseconds earlier. On a known backend-quirk error (423 /
+ * "already exists" — see {@link classifyFixtureError}) we re-check the system
+ * before skipping: a parallel worktree / CI run may simply have won the create
+ * race, in which case the object is already correct and we record it as
+ * unchanged rather than skipping a chunk of the suite.
+ */
+async function createActivateOrReconcile(
+  client: Client,
+  obj: PersistentObject,
+  desiredSource: string,
+  summary: FixtureSyncSummary,
+  verifiedActiveSources: Set<string>,
+  mode: 'create' | 'recreate',
+): Promise<void> {
+  const label = `${obj.type} ${obj.name}`;
+  try {
+    await createObjectFromFixture(client, obj);
+    await activateObject(client, obj.type, obj.name);
+    (mode === 'create' ? summary.created : summary.recreated).push(label);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const reason = classifyFixtureError(msg);
+    if (reason === null) throw err;
+    // Only a create RACE (a concurrent run beat us to the same object) is worth
+    // re-polling; release gaps / stale phantoms can never appear via a re-check,
+    // so skip them immediately as before (no wasted poll/backoff).
+    if (isConcurrencyRaceError(msg)) {
+      const recon = await reconcileConcurrentFixture(client, obj, desiredSource);
+      if (recon === 'reconciled') {
+        console.log(`    [setup] ${label}: produced by a concurrent run — reconciled (source matches)`);
+        summary.unchanged.push(label);
+        verifiedActiveSources.add(label);
+        return;
+      }
+      if (recon === 'drift') {
+        const driftReason =
+          'Concurrent run created a different version of this fixture (likely another branch) — re-run once it finishes';
+        console.warn(`    [setup] ${label}: skipping ${mode} — ${driftReason}`);
+        summary.skipped.push({ label, reason: driftReason });
+        return;
+      }
+    }
+    console.warn(`    [setup] ${label}: skipping ${mode} — ${reason}`);
+    summary.skipped.push({ label, reason });
+  }
+}
+
+/** A create error that looks like a lost race — another run created the same object first. */
+function isConcurrencyRaceError(message: string): boolean {
+  return (
+    /status 423.*invalid lock handle/i.test(message) ||
+    /already exists/i.test(message) ||
+    /does already exist/i.test(message)
+  );
+}
+
+/**
+ * After a create race, poll a few times to see whether the object now exists on
+ * SAP and matches our fixture:
+ *   - 'reconciled' — present with matching source (another run won; we idempotently
+ *     re-activate in case that run hasn't finished activating yet)
+ *   - 'drift'      — present but DIFFERENT source (a genuinely conflicting writer,
+ *     e.g. another branch) — caller skips rather than fighting it
+ *   - 'absent'     — still not there, so the original error stands
+ */
+async function reconcileConcurrentFixture(
+  client: Client,
+  obj: PersistentObject,
+  desiredSource: string,
+): Promise<'reconciled' | 'drift' | 'absent'> {
+  const expectedType = obj.type.toUpperCase();
+  // Probe first (an "already exists" race means the object is there NOW), then a
+  // single short re-poll for a still-in-flight create. The whole body is guarded
+  // so a read/search failure mid-reconcile (release-gapped source read, object
+  // locked by the other run) returns 'absent' and the caller records the
+  // ORIGINAL skip — never an uncaught throw that aborts the entire sync.
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const types = await findExistingObjectTypes(client, obj.name);
+      if (types.includes(expectedType)) {
+        const live = normalizeSource(await readObjectSource(client, obj.type, obj.name), obj.type);
+        if (live !== desiredSource) return 'drift';
+        try {
+          await activateObject(client, obj.type, obj.name);
+        } catch {
+          // best-effort — the other run may hold the lock or have already activated it
+        }
+        return 'reconciled';
+      }
+    } catch {
+      // fall through to the retry / 'absent' — see the comment above
+    }
+    if (attempt < 2) await delay(1500);
+  }
+  return 'absent';
 }
 
 // Types SAPWrite(action="delete") accepts. SAP-generated siblings like STOB (structure
@@ -277,9 +359,9 @@ async function findExistingObjectTypes(client: Client, name: string): Promise<st
     const objectType = getString(entry, 'objectType');
     if (!objectName || !objectType) continue;
     // On NW 7.50 the search result decorates the name with a display suffix
-    // like "ZIF_ARC1_TEST (Interface)". Normalize by stripping anything after
-    // the first space or "(" so equality matches the bare object name.
-    const bareName = objectName.split(/\s|\(/)[0];
+    // like "ZIF_ARC1_TEST (Interface)". Normalize to the bare name (shared with
+    // the janitor's selector) so equality matches.
+    const bareName = bareObjectName(objectName);
     if (bareName.toUpperCase() !== name.toUpperCase()) continue;
     types.add(objectType.split('/')[0].toUpperCase());
   }
@@ -301,7 +383,15 @@ async function assertSyncedFixturesActive(
   const checkedFixtures = PERSISTENT_OBJECTS.filter((obj) => !skippedLabels.has(`${obj.type} ${obj.name}`));
   if (checkedFixtures.length === 0) return;
 
-  const inactiveFixtures = await findInactiveFixtures(client, checkedFixtures);
+  let inactiveFixtures = await findInactiveFixtures(client, checkedFixtures);
+  // Only wait-and-recheck if THIS run actually issued an activation that might
+  // still be settling. If everything was already unchanged, an inactive fixture
+  // is a durable problem — fail fast instead of paying a blind 5s.
+  const issuedActivations = summary.created.length > 0 || summary.recreated.length > 0;
+  if (inactiveFixtures.length > 0 && issuedActivations) {
+    await delay(5000);
+    inactiveFixtures = await findInactiveFixtures(client, checkedFixtures);
+  }
   if (inactiveFixtures.length > 0) {
     const details = inactiveFixtures
       .map((obj) => {

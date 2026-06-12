@@ -12,12 +12,52 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { expect } from 'vitest';
+import { RUN_ID } from '../helpers/run-id.js';
 import { skipTest } from '../helpers/skip-policy.js';
 
 /** MCP tool call result shape */
 export interface ToolResult {
   content: Array<{ type: string; text: string }>;
   isError?: boolean;
+}
+
+/**
+ * Generate a collision-safe, ABAP-valid unique object name for E2E writes.
+ * Embeds the per-run id (tests/helpers/run-id.ts) plus a timestamp and a random
+ * component, so two runs against the same SAP system never collide. Truncated to
+ * the ABAP 30-char object-name limit; keep prefixes short enough that the
+ * `_${RUN_ID}…` suffix survives the truncation.
+ */
+export function uniqueName(prefix: string): string {
+  const rand = Math.floor(Math.random() * 1e5)
+    .toString(36)
+    .toUpperCase()
+    .padStart(3, '0');
+  const ts = Date.now().toString(36).toUpperCase();
+  return `${prefix}_${RUN_ID}${ts}${rand}`.slice(0, 30);
+}
+
+/**
+ * Like {@link uniqueName} but the generated suffix is letters-only — for object
+ * types that reject digits in the generated portion (e.g. function-group naming
+ * in func-write.e2e). The prefix may still contain digits; only the suffix is
+ * constrained.
+ */
+export function uniqueLettersName(prefix: string): string {
+  const toLetters = (n: number): string => {
+    let s = '';
+    let v = n;
+    while (v > 0) {
+      s = String.fromCharCode(65 + (v % 26)) + s;
+      v = Math.floor(v / 26);
+    }
+    return s || 'A';
+  };
+  // RUN_ID is letters-only, so no separate mapping is needed. Random BEFORE the
+  // timestamp so per-call entropy survives caller-side truncation — rap-write
+  // call sites do `.slice(0, 16)` for ≤16-char CDS/TABL names, which would
+  // otherwise chop a trailing random component off entirely.
+  return `${prefix}${RUN_ID}${toLetters(Math.floor(Math.random() * 1e6))}${toLetters(Date.now())}`.slice(0, 30);
 }
 
 /** Server identity from /health endpoint */
