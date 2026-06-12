@@ -194,6 +194,61 @@ search(query="metadata-driven UI metadata extension RAP Fiori Elements", include
 
 Use the returned documentation to inform correct annotation patterns, draft handling, provider contracts, and behavior definition syntax.
 
+## Step 3b: (Optional) Delegate the build to SAP's official ABAP generator
+
+If the **official SAP ABAP MCP server** is connected alongside ARC-1 (it ships with ABAP Development Tools for VS Code and is enabled in Eclipse ADT 3.60+, where it appears as the `abap-mcp` server), you can hand the single-root build to SAP's own *Generate ABAP Repository Objects* framework and skip the manual templates in Steps 4–13. This is **optional** — every step below has an ARC-1 fallback, and the generator only fits a narrow shape.
+
+**Use the generator only when ALL of these hold** (otherwise skip to *Batch Creation* below):
+- Exactly **one root entity** — the generator does "a maximum of one entity", no compositions or hierarchies.
+- **Managed + draft** — the only mode it produces.
+- The base table carries the modern timestamp fields `last_changed : abp_lastchange_tstmpl` and `local_last_changed : abp_locinst_lastchange_tstmpl` (the generator requires them), **or** you use the *from-scratch* variant that generates the table for you.
+- You accept it is **one-shot** — "not intended for post-generation". Re-running won't extend an existing BO; later changes are manual (ARC-1's job).
+
+### 3b-1. Probe the server
+If you do **not** have a tool named `abap_generators-list_generators` (the official `abap-mcp` server), it isn't connected → skip to *Batch Creation*. Don't ask the user — just fall back silently.
+
+### 3b-2. Resolve the generator ID (IDs are release-specific — NEVER hardcode)
+Call `abap_generators-list_generators` and pick the generator whose **display name** is "OData UI Service" (for a Fiori UI app) or "OData Web API Service" (for a headless API), then use the **`id` it returns**. The IDs differ by release — proven live:
+
+| Release | UI service | Web API service | From scratch (generates the table too) |
+|---|---|---|---|
+| S/4HANA 2023 (SAP_BASIS 758) | `uiservice` | `webapiservice` | — |
+| ABAP Platform 2025 (SAP_BASIS 816) | `ui-service` | `webapi-service` | `x-ui-service` |
+
+If no matching generator is listed, the framework isn't available on this release → skip to *Batch Creation*.
+
+### 3b-3. Read the input schema
+`abap_generators-get_schema` needs five inputs and errors without a real referenced table:
+
+```
+abap_generators-get_schema(
+  generatorId          = "<id from 3b-2>",
+  packageName          = "<target package>",       // your allowlisted package, or $TMP
+  referencedObjectType = "TABL",
+  referencedObjectName = "<existing base table>")
+```
+
+(The from-scratch `x-ui-service` does not need a referenced table — confirm from the schema it returns.) Typical config points in the returned schema: package, data model (root entity name + EML alias), behavior (draft table name), service projection name, service definition, service binding (OData service name), transport. **Read the real schema and fill every required field** — don't assume field names from this doc; they vary by release.
+
+Observed shape on S/4HANA 2023 (`uiservice`, referenced table `ZARC1_DEMO_BOOK`) — verified live; yours may differ, so read the live response:
+
+```
+dataModelEntity.cdsName  → ZR_ARC1_DEMO_BOOK      (root CDS)
+implementationClass      → ZBP_ARC1_DEMO_BOOK     (behavior pool class)
+draftTable               → ZARC1_DEMO_BOOKD
+serviceProjection.name   → ZC_ARC1_DEMO_BOOK       (projection CDS, exposed by the service)
+serviceDefinition.name   → ZUI_ARC1_DEMO_BOOK_O4
+serviceBinding.name      → ZUI_ARC1_DEMO_BOOK_O4   (binding type: OData V4 - UI)
+```
+
+### 3b-4. Generate
+`abap_generators-generate_objects(generatorId="<id>", <filled schema>)`. This is a **mutation** — apply the same guardrails as any ARC-1 write (allowlisted package + a real transport, or `$TMP`). One call creates the CDS root + projection, BDEF + behavior class, metadata extension (DDLX), draft table, service definition, and service binding.
+
+### 3b-5. Verify, then continue with ARC-1
+Activate/verify with ARC-1 (`SAPActivate`, `SAPRead`) or the official `abap_activate_objects`. **Publish the service binding with ARC-1** — `SAPActivate(action="publish_srvb", name="<binding>")` — because on 7.5x the generator creates and activates the SRVB but its *own* publish step returns a 406 (publish-job content negotiation), leaving it `published:false` with no runtime URL. ARC-1's `publish_srvb` handles the 758 content type and flips it to `published:true` (verified live on S/4HANA 2023: the generated binding went unpublished → published, and `$metadata` then returned HTTP 200). Then use **ARC-1** for anything the single-entity, one-shot generator can't do — add fields, compositions/children, actions + handler bodies (`SAPWrite action="edit_method"`), determinations, validations, and all later edits.
+
+**State which path you took** ("base BO generated via `abap-mcp` `<id>`, extended via ARC-1" vs "built entirely via ARC-1") so the run stays auditable.
+
 ## Batch Creation (Preferred)
 
 Instead of creating each artifact individually in Steps 4-13, you can use batch creation to create all RAP artifacts in a single tool call:

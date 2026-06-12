@@ -29,7 +29,7 @@ resettable package.
 | Projection layer | **Mandatory — always create a `ZC_*` projection alongside every `ZR_*` root view**. Service binding exposes the projection, never the root. | Run 1 of the skill skipped projections after a misread CDS error; spell out so the LLM never drops them. |
 | `provider contract` on projections | **On the root projection only**, not on the root view, not on child projections. The contract sits at exactly one level. Use `transactional_query` when combining projection BDEF + `use draft` on 7.58; `transactional_interface` for read-mostly without draft. | Putting it on a root view → *"only valid on projection views"*. Putting it on child projections → *"inappropriate provider contract on …"*. Children are exposed via `redirected to parent` and inherit the BO contract from the root projection. Run 3 confirmed `_query` is needed for draft on 7.58. |
 | CDS composition syntax (managed) | `composition [0..*] of <child> as <name>` — **no `on` clause**. Key linking is implicit via matching key fields / `with foreign key` in the child | 7.58 rejects `on` on managed compositions. The recovery is dropping `on`, not switching to `association to`. |
-| `@Semantics.*` on 7.58 | Use only `@Semantics.systemDateTime.createdAt : true` and `@Semantics.systemDateTime.lastChangedAt : true`. Do NOT use `localInstanceLastChangedAt`, `businessDate.*`, or other newer annotations. | Run 2 hit *"Annotation `Semantics.systemDateTime.localInstanceLastChangedAt` is unknown"* on 7.58. Those came in 7.59+. Same for `@Semantics.businessDate.*`. |
+| `@Semantics.*` on 7.58 | `createdAt`, `lastChangedAt`, **and `localInstanceLastChangedAt`** are all valid on 7.58 — put `localInstanceLastChangedAt` on the local-instance etag field (`abp_locinst_lastchange_tstmpl`), exactly as SAP's own RAP generator does. `@Semantics.businessDate.from/to` also work. | Verified live on S/4HANA 2023 (758, 2026-06-12): standalone CDS views with `localInstanceLastChangedAt` and with `businessDate.from/to` both activate. An earlier "unknown annotation on 7.58" note was a misdiagnosis — draft annotations are genuinely absent only on pre-7.55 releases. |
 | Draft table field names (when draft=ON) | Use BO-alias casing **without underscores** — e.g. `projectid`, `startdate`, NOT `project_id`, `start_date`. ABAP normalizes BDEF aliases (`ProjectId`, `StartDate`) to `PROJECTID`, `STARTDATE` — the draft table lookup is by that normalized name, not by the active table's snake_case. | Run 2: BDEF activation failed with *"key field PROJECTID expected at position 2, found PROJECT_ID"*. The active table can keep snake_case (BDEF mapping handles it); the draft table cannot — it has no mapping clause. |
 | Naming | SAP-standard `Z<prefix>_<entity>`: `ZR_` root, `ZC_` projection, `ZI_<entity>_BEH` BDEF, `ZBP_` behavior pool, `ZUI_<service>_O4` V4 SRVB | Aligns with SAP-internal conventions; the leading `Z` is the customer namespace |
 | Pre-write lint | On | Set `SAP_ABAP_RELEASE=<your_release>` in ARC-1 config (PR #255) so the lint preset matches the system release. The older `SAP_LINT_BEFORE_WRITE=false` workaround is no longer needed. |
@@ -482,6 +482,43 @@ SAPQuery(action="sql", sql="SELECT obj_name, object, devclass, korrnum FROM tadi
 If a planned name appears in a *different* package, it's a leftover stub — delete via its
 actual transport before proceeding.
 
+### 6a-gen. (Optional) Seed the root BO via SAP's official ABAP generator
+
+If the **official SAP ABAP MCP server** is connected alongside ARC-1 (ships with ABAP Development
+Tools for VS Code; enabled in Eclipse ADT 3.60+; appears as the `abap-mcp` server), its
+*Generate ABAP Repository Objects* framework can scaffold the **root** managed+draft BO for you.
+It does **not** replace this skill — Phases 1–5 (discovery + translation) and most of Phase 6 are
+still ARC-1's job, because the generator is **single-entity and one-shot**:
+
+> *"a maximum of one entity, no compositions or hierarchies"* and *"not intended for
+> post-generation — subsequent changes require manual developer intervention."*
+
+So it fits a SEGW migration **only** when the legacy service is effectively a **single root entity**,
+managed+draft, whose table carries the modern timestamp fields `last_changed : abp_lastchange_tstmpl`
+and `local_last_changed : abp_locinst_lastchange_tstmpl`. Most SEGW services are multi-entity with
+classic `ERDAT/AEDAT` admin fields and function imports → **the generator does not apply; use the
+manual build (6b) as normal.** Where it *does* apply, it only seeds the root; ARC-1 still adds the
+children, compositions, actions, and field mappings afterward (the generator can't, being one-shot).
+
+If you use it:
+
+1. **Probe.** No `abap_generators-list_generators` tool (the `abap-mcp` server) → skip to 6b, build manually.
+2. **Resolve the ID — release-specific, never hardcode.** Call `abap_generators-list_generators`,
+   match the **"OData UI Service"** generator by display name, use the **returned `id`** (proven live:
+   `uiservice` on SAP_BASIS 758 / S4 2023; `ui-service` on 816 / ABAP Platform 2025; 816 also has
+   `x-ui-service` "from scratch"). Not listed → skip to 6b.
+3. **Schema → generate.** `abap_generators-get_schema(generatorId, packageName="<target_package>",
+   referencedObjectType="TABL", referencedObjectName="<root table, e.g. ZDM_PROJECT>")`, fill every
+   required field from the **returned** schema, then `abap_generators-generate_objects(generatorId, …)`.
+   This is a mutation — target `<target_package>` + `<transport>`, same guardrails as any write.
+4. **Hand back to ARC-1.** Continue at **Step 2 onward in 6b** for the children/compositions, the
+   projection contract level, the action (`approve_project`) + handler body, and activation —
+   adapting the names the generator chose for the root. Reconcile its root CDS/BDEF naming with this
+   skill's `ZR_*`/`ZC_*`/`ZI_*_BEH` plan, or accept the generator's names and update Phase 5f's contract.
+
+State which path you took so the run stays auditable. **When in doubt, prefer the manual build (6b)** —
+it is the proven path for the multi-entity SEGW shape and never depends on a second MCP server.
+
 ### 6b. Build order — strict, no improvisation
 
 The order below was learned the hard way (Run 1, calls #22–33). **Do not reorder.** Each step
@@ -551,10 +588,12 @@ Top-down: parent first, then children. Use `composition [0..*] of <child> as <na
 **no `on` clause** for managed scenario.
 
 If your legacy DPC_EXT did Aedat → Erdat fallback (run 1 found this), bake it into the root
-view's timestamp computation. **Use 7.58-compatible annotations only**:
-`@Semantics.systemDateTime.createdAt` and `@Semantics.systemDateTime.lastChangedAt`.
-**Do NOT use** `localInstanceLastChangedAt`, `localInstanceCreatedAt`, or any
-`@Semantics.businessDate.*` — those came in 7.59+ and 7.58 rejects them as unknown.
+view's timestamp computation. On 7.58 use `@Semantics.systemDateTime.createdAt`,
+`lastChangedAt`, **and `localInstanceLastChangedAt`** — the last annotates the local-instance
+etag field (`abp_locinst_lastchange_tstmpl`) that a managed-draft BO needs, and is exactly what
+SAP's own RAP generator emits on 758. **Verified live on S/4HANA 2023:** standalone views with
+`localInstanceLastChangedAt` and with `@Semantics.businessDate.from/to` both activate. Only
+genuinely old releases (< 7.55, before draft support) lack these — do NOT strip them on 7.58.
 
 ```cds
 @Semantics.systemDateTime.createdAt : true
@@ -1115,7 +1154,7 @@ SAPTransport(action="create", description="ARC-1 RAP migration outputs (resettab
 | Phase 6 — CDS rejects `tstmp_from_dat_tim(...)` | Function name wrong | Use `dats_tims_to_tstmp(...)` (note the order: `dats` first, `tims` second) |
 | Phase 6 — Batch activate emits `ED 064 — "no next/previous object found"` warning | Benign batch-activate quirk in 7.58 | Ignore the warning; if all objects show `active`, batch succeeded. If a real error mixed in, retry with single-object activate. |
 | Phase 6a — `SAPWrite create` returns "object exists" but Phase 6a reset showed empty package | Object exists in a different transport, not the target package | Query TADIR for the name across all packages: `SAPQuery sql="SELECT * FROM tadir WHERE obj_name = '<name>'"`. If found, delete it first using its actual transport, then retry create. |
-| Phase 6 Step 2/3 — CDS rejects `@Semantics.systemDateTime.localInstanceLastChangedAt` or `@Semantics.businessDate.*` as "unknown annotation" | These annotations were added in 7.59+; on 7.58 they don't exist | Use `@Semantics.systemDateTime.createdAt` / `@Semantics.systemDateTime.lastChangedAt` (without `localInstance`). For business dates: just use `@Semantics.businessDate.from/to` if available, else omit. |
+| Phase 6 Step 2/3 — CDS genuinely rejects `@Semantics.systemDateTime.localInstanceLastChangedAt` or `@Semantics.businessDate.*` as "unknown annotation" | The system is pre-7.55 (before draft support). On **7.58 these are valid** — verified live on S/4HANA 2023; SAP's own generator emits `localInstanceLastChangedAt` on 758 | On 7.58 keep them. Only on a genuinely older release (< 7.55) fall back to `createdAt`/`lastChangedAt` and omit the local-instance / businessDate annotations. |
 | Phase 6 Step 3 — CDS rejects "inappropriate provider contract on `ZC_DM_<child>`" | `provider contract transactional_interface` was put on a child projection | Remove the contract from `ZC_DM_TASK` / `ZC_DM_TIMEENTRY`. The contract goes only on the *root* projection (`ZC_DM_PROJECT`). Children declare bare `as projection on …` and use `redirected to parent` for upward navigation. |
 | Phase 6 Step 5 — BDEF activation rejects with `"key field PROJECTID expected at position 2, found PROJECT_ID"` (or similar field-name mismatch on a draft table) | Draft table was written with snake_case field names (`project_id`, `start_date`) instead of the BO-alias-normalized names (`projectid`, `startdate`) | Rewrite the draft TABL with field names matching the BO aliases: drop underscores. Active table can keep snake_case (BDEF mapping bridges); draft table cannot. Use `update + activate` via SAPWrite — Run 2 confirmed this works. |
 | Phase 6a — `SAPQuery` returns HTTP 400 on a long `WHERE obj_name IN ('a','b','c',…)` filter | ARC-1 ≥ 0.10.0 auto-chunks simple long `IN (…)` literal lists (PR #254). Older builds and complex filters (`NOT IN`, multi-SELECT, subqueries) still hit 400. | Prefer `SAPSearch(searchType="tadir_lookup", source="both", names=[...])` for cross-package existence checks (PR #256 + PR #270) — no SQL needed; the `splitBrain` warning array surfaces ADT/DB divergence in one call. As broader-sweep fallback, `SAPQuery` with `devclass = '<package>'`. |
