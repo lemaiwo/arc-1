@@ -8,9 +8,25 @@ and per-user principal propagation. This is the FEAT-61 extension framework.
     The extension API (`arc-1/public`) is **`@experimental`** — it may break in any release. A plugin
     declares a single `apiVersion` integer as the compatibility fuse. No semver guarantee yet.
 
-- **Worked sample:** [`arc-mcp/arc-1-extension-sample`](https://github.com/arc-mcp/arc-1-extension-sample) — two code tools + one manifest tool, **live-verified against S/4HANA**.
+- **Worked sample:** [`arc-mcp/arc-1-extension-sample`](https://github.com/arc-mcp/arc-1-extension-sample) — ADT + OData reads, a manifest tool, a gated console-class execute, an OData write, and a full LISA custom-ICF integration, **all live-verified against S/4HANA**.
 - **Guided setup:** the **`create-arc1-extension`** skill (`.claude/skills/create-arc1-extension/`) walks you through the decisions, scaffolds the plugin, and points out the security implications for your use case.
 - **Design:** `docs/research/extension-framework-spec.md` (spec) + `extension-framework-deep-research.md` (rationale).
+
+---
+
+## What you can build
+
+Each row links to a worked, live-verified tool in the [sample repo](https://github.com/arc-mcp/arc-1-extension-sample):
+
+| Use case | How | Sample tool |
+|---|---|---|
+| **Token-efficient read wrapper** — expose one SAP read as a focused tool | manifest tier (no code) or `ctx.http.get` | `Custom_ReadProgram` (manifest), `Custom_ProgramLineCount` |
+| **Custom diagnostics** — SM37 jobs, SLG1 / application logs, gateway logs, ST22 dumps | wrap the relevant ADT/OData/ICF read | (pattern of `Custom_ProgramLineCount`) |
+| **Business-data read/write** — query or create entities in an OData service | `ctx.http.get` / `ctx.http.post` | `Custom_QuerySalesOrders`, `Custom_CreateSalesOrder` |
+| **Drive a custom ABAP HTTP service** — e.g. translation management with [LISA](https://github.com/ClementRingot/LISA) | gated `ctx.http.post` to `/sap/bc/http/sap/<service>` | `Custom_ListLanguages` / `GetTranslation` / `SetTranslation` |
+| **Run ad-hoc ABAP** — execute a console class and return its output | `ctx.run.classRun` | `Custom_RunClass` |
+
+Writes and execution are **off by default** and opt-in per deployment (see [Security & roles](#security--roles-by-use-case)); ADT **object** writes (CLAS/DDLS/…) stay a v2 item.
 
 ---
 
@@ -38,13 +54,13 @@ Extensions never ship ABAP — any custom endpoint they call must already exist 
 
 Both produce a `Custom_*` tool, gated identically.
 
-!!! warning "v1 is read-only — with one gated exception"
-    Both tiers are **read-only** in v1: `ctx.http` exposes **`GET`/`HEAD` only**. General write/`POST`
-    support is deferred to v2 because a raw write can't be constrained by `SAP_ALLOWED_PACKAGES`
-    (package resolution needs the ADT object-URL shape); shipping un-package-gated writes would bypass
-    the server safety ceiling. The **one** privileged op available in v1 is **executing a console class**
-    (`ctx.run.classRun`, see below) — a *named* operation (not a generic POST, so no package-bypass),
-    locked behind a default-off opt-in. v2 adds the full package-aware write vocabulary.
+!!! warning "Reads are open; writes are gated and opt-in"
+    `ctx.http` always allows **`GET`/`HEAD`**. **Writes** (`POST`/`PUT`/`DELETE`) are allowed **only to
+    non-ADT paths** (OData/ICF) and **only** behind the default-off opt-in `SAP_ALLOW_PLUGIN_RAW_WRITES`
+    (see [Writing](#writing-non-adt-odataicf)). Writes to **`/sap/bc/adt/…` object endpoints are always
+    refused** — they need `SAP_ALLOWED_PACKAGES` enforcement that a raw path can't provide; those wait
+    for the v2 package-aware `ctx.write` vocabulary. The other privileged op is **executing a console
+    class** (`ctx.run.classRun`, below). Manifest tools stay GET-only.
 
 ---
 
@@ -121,9 +137,10 @@ v1 manifests are **read-only GET**: `additionalProperties:false` is required, `p
 
 ## Calling SAP APIs
 
-Everything goes through **`ctx.http`** — a **gated, read-only** (`GET`/`HEAD`) wrapper over ARC-1's
-authenticated client. It can reach **any SAP path** on the connected system, with auth, CSRF, cookies,
-per-user PP, and sessions handled for you:
+Everything goes through **`ctx.http`** — a **gated** wrapper over ARC-1's authenticated client
+(`GET`/`HEAD` always; `POST`/`PUT`/`DELETE` to **non-ADT** paths behind the raw-write opt-in — see
+[Writing](#writing-non-adt-odataicf)). It can reach **any SAP path** on the connected system, with
+auth, CSRF, cookies, per-user PP, and sessions handled for you:
 
 | API | Example |
 |---|---|
@@ -138,6 +155,48 @@ just hidden by types.
 !!! warning "OData/ICF specifics"
     A service must be **activated in `/IWFND`** even if it appears in the catalog (a 403 *"No service
     found"* means it is registered but not activated).
+
+---
+
+## Writing (non-ADT, OData/ICF)
+
+A code-tier tool can **write** to a SAP **OData service** or a **custom ICF endpoint** with
+`ctx.http.post` / `put` / `delete` — the same gated client, with CSRF fetched + attached
+automatically. This is exactly how you'd wrap a custom write service (e.g. a translation setter that
+POSTs to `/sap/bc/http/sap/your_service`):
+
+```ts
+export default defineTool({
+  name: 'Custom_SetSomething',
+  description: 'Write via a custom OData/ICF service.',
+  schema: z.object({ id: z.string(), value: z.string() }),
+  policy: { scope: 'write', opType: OperationType.Update },   // a write verb needs write scope
+  async handler(args, ctx) {
+    const a = args as { id: string; value: string };
+    const res = await ctx.http.post('/sap/bc/http/sap/your_service', JSON.stringify(a), 'application/json',
+      { Accept: 'application/json' });
+    return { content: [{ type: 'text', text: `HTTP ${res.statusCode}\n${res.body}` }] };
+  },
+});
+```
+
+Refused with an `AdtSafetyError` unless **all** hold:
+
+| Gate | Why |
+|---|---|
+| `SAP_ALLOW_PLUGIN_RAW_WRITES=true` | dedicated opt-in (default off) — raw writes aren't constrained by `SAP_ALLOWED_PACKAGES` (no ABAP package in an OData/ICF path), so the admin opts in explicitly |
+| `SAP_ALLOW_WRITES=true` | the server write ceiling (`checkOperation`) |
+| tool declares `scope: 'write'` | POST→Create / PUT→Update / DELETE→Delete all require `write` |
+| path is **not** under `/sap/bc/adt/` | ADT object writes need package enforcement → always refused; use the (v2) `ctx.write` vocabulary for those |
+
+!!! note "What `SAP_ALLOWED_PACKAGES` does and doesn't cover here"
+    The package allowlist gates **ADT object** writes. It does **not** apply to OData/ICF paths (there
+    is no ABAP package in them) — those writes are gated by the opt-in + `allowWrites` + scope +
+    `denyActions` + the service's own SAP-side auth (+ Cloud Connector resource allowlist on BTP). The
+    custom service's ABAP handler owns its locking/transport.
+
+ADT **object** create/update/delete (CLAS, DDLS, …) stay on the roadmap as the package-aware v2
+`ctx.write` vocabulary — see `docs/research/extension-framework-v2-spec.md`.
 
 ---
 
@@ -172,8 +231,8 @@ framework — **all** of the following must hold, or the call is refused with an
 | user has the `write` scope + SAP-side execute auth | the usual `scope ∧ SAP-auth` |
 
 `classRun` is a **named** op (not a raw POST), so a plugin can only run a class **by name** (validated,
-no path injection) — it cannot reach arbitrary write endpoints. That's why it can ship in read-only v1
-safely; the general write surface still waits for v2.
+no path injection) — it cannot reach arbitrary endpoints. That's why it has its own dedicated gate,
+distinct from the raw `ctx.http` write surface; ADT **object** writes still wait for the v2 `ctx.write`.
 
 ---
 
@@ -183,8 +242,9 @@ safely; the general write surface still waits for v2.
     A code plugin is `import()`-ed into the ARC-1 process and runs with the **full privileges of the
     server**: it can read `process.env` (SAP credentials, the XSUAA `clientsecret`, the DCR signing
     secret), read/write the local filesystem, open outbound network connections, and spawn processes.
-    The gated `ctx` (read-only `ctx.http`, the blocked `ctx.client`, the `classRun` gate) is a **clean
-    API surface** that protects against a *buggy or over-eager* plugin and honours the admin's posture
+    The gated `ctx` (GET/HEAD + opt-in non-ADT writes on `ctx.http`, the blocked `ctx.client`, the
+    `classRun` + raw-write gates) is a **clean API surface** that protects against a *buggy or
+    over-eager* plugin and honours the admin's posture
     — it is **not** a containment boundary against a *hostile* one (a malicious plugin doesn't need
     `ctx`; it has `child_process`). **Loading a plugin is exactly as much a trust decision as adding a
     dependency to ARC-1 itself.** Only load plugins you have reviewed, and:
@@ -206,13 +266,14 @@ Declare `policy: { scope, opType }` to match the operation your tool performs. T
 | Use case | `scope` | `opType` | Server flag the admin must set | The user needs (XSUAA role / OIDC scope / API-key profile) |
 |---|---|---|---|---|
 | Read-only diagnostic (ADT/OData/ICF) | `read` | `R` | — | `read` |
-| Create / update / delete an ABAP object *(v2)* | `write` | `C`/`U`/`D` | `SAP_ALLOW_WRITES=true` **+** target package in `SAP_ALLOWED_PACKAGES` | `write` |
+| **Write to an OData/ICF service** (`ctx.http.post`/`put`/`delete`) | `write` | `C`/`U`/`D` | `SAP_ALLOW_PLUGIN_RAW_WRITES=true` **+** `SAP_ALLOW_WRITES=true` | `write` |
+| Run a console class (`ctx.run.classRun`) | `write` | `W` | `SAP_ALLOW_PLUGIN_EXECUTE=true` **+** `SAP_ALLOW_WRITES=true` | `write` |
+| Create / update / delete an **ADT object** *(v2)* | `write` | `C`/`U`/`D` | `SAP_ALLOW_WRITES=true` **+** target package in `SAP_ALLOWED_PACKAGES` | `write` |
 | Table-content preview *(v2)* | `data` | `Q` | `SAP_ALLOW_DATA_PREVIEW=true` | `data` |
 | Free-style SQL *(v2)* | `sql` | `F` | `SAP_ALLOW_FREE_SQL=true` | `sql` |
-| Transport operation *(v2)* | `transports` | `X` | `SAP_ALLOW_TRANSPORT_WRITES=true` | `transports` |
 
-Since v1 `ctx.http` is read-only, only the `read` row is live today; the rest document the model for the
-v2 write surface (and the package-allowlist enforcement that ships with it).
+Live today: reads, the gated **OData/ICF write**, and `classRun`. The *(v2)* rows — ADT **object**
+writes, data preview, SQL — wait for the package-aware `ctx.write` surface and scoped `ctx.data`/`ctx.sql`.
 
 Key points:
 
@@ -230,8 +291,8 @@ Key points:
   sandbox by design. The `ctx` gates bound a buggy plugin and the server's posture, not a hostile one.
 - **`policy.opType` is checked at registration, not per HTTP call.** The declared `scope` must cover
   the `opType`'s required scope (a tool can't claim `read` while declaring a write op, else it
-  fails-fast at load). In v1 the *runtime* gates are the read-only `ctx.http` and `classRun`'s own
-  checks; `opType` is reused for v2's write gating.
+  fails-fast at load). In v1 the *runtime* gates are `ctx.http`'s method + raw-write-opt-in checks and
+  `classRun`'s own checks; `opType` is reused for v2's write gating.
 
 ---
 
@@ -309,12 +370,12 @@ already `vcap`-owned, so this is a non-issue there.
 
 ## Roadmap (v2)
 
-v1 is **read-only** on purpose. The biggest v2 item is a **package-aware write surface** — a
-`ctx.write` vocabulary that routes ADT object writes through the same package-allowlist gate built-in
-`SAPWrite` uses (so a plugin still can't write outside `SAP_ALLOWED_PACKAGES`), plus opt-in raw writes
-for package-less OData/ICF calls. Also planned: a safe per-user `ctx.cache`, directory + npm-package
-loading, `package.json#arc1.requires` capability intersection, per-handler timeouts, and graduating
-the API from `@experimental` to semver-stable. Full design:
+v1 ships **reads**, gated **non-ADT (OData/ICF) writes**, and **`classRun`**. The biggest remaining v2
+item is the **package-aware ADT *object* write surface** — a `ctx.write` vocabulary that routes
+CLAS/DDLS/… writes through the same package-allowlist gate built-in `SAPWrite` uses (so a plugin still
+can't write outside `SAP_ALLOWED_PACKAGES`). Also planned: a safe per-user `ctx.cache`, directory +
+npm-package loading, `package.json#arc1.requires` capability intersection, per-handler timeouts, and
+graduating the API from `@experimental` to semver-stable. Full design:
 `docs/research/extension-framework-v2-spec.md`.
 
 ---
