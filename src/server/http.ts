@@ -37,6 +37,7 @@ import { API_KEY_PROFILES } from './config.js';
 import { authLibLogger, logger } from './logger.js';
 import { VERSION } from './server.js';
 import type { ServerConfig } from './types.js';
+import { mountUiRoutes, type UiServerDeps } from './ui.js';
 
 // ─── API Key Entry Mapping ───────────────────────────────────────────
 
@@ -193,6 +194,7 @@ export async function startHttpServer(
   serverFactory: () => McpServer,
   config: ServerConfig,
   xsuaaCredentials?: XsuaaCredentials,
+  uiDeps?: UiServerDeps,
 ): Promise<void> {
   const [host, portStr] = config.httpAddr.split(':');
   const port = Number.parseInt(portStr || '8080', 10);
@@ -229,6 +231,10 @@ export async function startHttpServer(
   app.use(express.json());
   app.use(express.urlencoded({ extended: false }));
   const mcpHandler = createMcpHandler(serverFactory);
+  const hasAdminApiKey = config.apiKeys?.some((entry) => entry.profile === 'admin') ?? false;
+  if (uiDeps && !(hasAdminApiKey || config.oidcIssuer || (config.xsuaaAuth && xsuaaCredentials))) {
+    throw new Error('ARC1_UI=web requires an admin API key, OIDC, or XSUAA HTTP authentication.');
+  }
 
   // ─── Global Request Logger ──────────────────────────────────
   // Log every inbound request for debugging OAuth/MCP flows.
@@ -321,6 +327,14 @@ export async function startHttpServer(
       verifier: { verifyAccessToken: chainedVerifier },
       resourceMetadataUrl,
     });
+    if (uiDeps) {
+      const uiBearerAuth = requireBearerAuth({
+        verifier: { verifyAccessToken: chainedVerifier },
+        requiredScopes: ['admin'],
+        resourceMetadataUrl,
+      });
+      mountUiRoutes(app, uiDeps, uiBearerAuth);
+    }
 
     // ─── Layer 1: per-IP rate limiters on OAuth endpoints + /mcp ────────
     // Mounted BEFORE the auth router so spammed credentials are rejected before any
@@ -551,6 +565,13 @@ export async function startHttpServer(
       const { requireBearerAuth } = await import('@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js');
       const verifier = await createStandardVerifier(config);
       const bearerAuth = requireBearerAuth({ verifier: { verifyAccessToken: verifier } });
+      if (uiDeps) {
+        const uiBearerAuth = requireBearerAuth({
+          verifier: { verifyAccessToken: verifier },
+          requiredScopes: ['admin'],
+        });
+        mountUiRoutes(app, uiDeps, uiBearerAuth);
+      }
       app.all('/mcp', bearerAuth, mcpHandler);
     } else {
       // No auth configured — open access
@@ -576,6 +597,7 @@ export async function startHttpServer(
       addr: `${bindHost}:${port}`,
       health: `http://${bindHost}:${port}/health`,
       mcp: `http://${bindHost}:${port}/mcp`,
+      ui: uiDeps ? `http://${bindHost}:${port}/ui/` : undefined,
       auth: authMode,
     });
   });

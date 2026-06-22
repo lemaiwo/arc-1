@@ -102,7 +102,7 @@ describe('mcpb-manifest.json (Claude Desktop bundle)', () => {
 
 describe('config surface parity (plugin ↔ mcpb)', () => {
   const mcpb = readJson('mcpb-manifest.json');
-  // Every SAP_* the server reads must be wired in BOTH surfaces — not just the capability gates.
+  // Every env var exposed by the packaged config surfaces must be wired in BOTH surfaces.
   const ENV_KEYS = [
     'SAP_URL',
     'SAP_USER',
@@ -116,6 +116,9 @@ describe('config surface parity (plugin ↔ mcpb)', () => {
     'SAP_ALLOW_FREE_SQL',
     'SAP_ALLOW_TRANSPORT_WRITES',
     'SAP_ALLOW_GIT_WRITES',
+    'ARC1_UI',
+    'ARC1_UI_OPEN',
+    'ARC1_UI_ADDR',
   ];
 
   const surfaces: Record<string, { env: Record<string, string>; cfg: Record<string, Record<string, unknown>> }> = {
@@ -124,7 +127,7 @@ describe('config surface parity (plugin ↔ mcpb)', () => {
   };
 
   for (const [name, { env, cfg }] of Object.entries(surfaces)) {
-    it(`${name} wires every SAP_* env var to an existing user_config key`, () => {
+    it(`${name} wires every packaged env var to an existing user_config key`, () => {
       expect(Object.keys(env).sort()).toEqual([...ENV_KEYS].sort());
       for (const [key, value] of Object.entries(env)) {
         // Each value must be EXACTLY a ${user_config.<key>} substitution (anchored) — a typo like
@@ -149,6 +152,14 @@ describe('config surface parity (plugin ↔ mcpb)', () => {
       }
     }
   });
+
+  it('keeps the experimental UI disabled by default in packaged installs', () => {
+    for (const [name, { cfg }] of Object.entries(surfaces)) {
+      expect(cfg.arc1_ui?.default, `${name}.arc1_ui.default`).toBe(false);
+      expect(cfg.arc1_ui_open?.default, `${name}.arc1_ui_open.default`).toBe(false);
+      expect(cfg.arc1_ui_addr?.default, `${name}.arc1_ui_addr.default`).toBe('127.0.0.1:8711');
+    }
+  });
 });
 
 describe('version sync (release-please manages all four)', () => {
@@ -157,6 +168,15 @@ describe('version sync (release-please manages all four)', () => {
     expect(plugin.version).toBe(pkg);
     expect(readJson('mcpb-manifest.json').version).toBe(pkg);
     expect(readJson('server.json').version).toBe(pkg);
+  });
+});
+
+describe('deployment templates', () => {
+  it('keep the experimental UI explicitly disabled in CF descriptors', () => {
+    for (const rel of ['mta.yaml', 'manifest.yml', 'manifest-btp-abap.yml']) {
+      const body = readFileSync(join(ROOT, rel), 'utf8');
+      expect(body, rel).toContain('ARC1_UI: "off"');
+    }
   });
 });
 

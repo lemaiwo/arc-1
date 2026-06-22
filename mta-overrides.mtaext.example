@@ -104,6 +104,19 @@ modules:
       # Studio). Comma-separated, exact origin match, no wildcards.
       # ARC1_ALLOWED_ORIGINS: "https://my-app.cfapps.eu10.hana.ondemand.com"
 
+      # ── Read-only UI ─────────────────────────────────────────────────
+      # Experimental and off by default. For browser access on BTP CF, deploy
+      # with mta-ui-approuter.mtaext instead of uncommenting only this line:
+      #
+      #   npm run btp:build-deploy-ui-ext
+      #
+      # That extension enables ARC1_UI=web and activates the optional AppRouter,
+      # which performs XSUAA login and forwards an admin-scoped JWT to ARC-1.
+      # The deploy script writes an ignored mta-ui-deploy.mtaext by merging this
+      # file with the UI activation, so your destination/route/xsappname values
+      # stay in the same single extension descriptor passed to `cf deploy`.
+      # ARC1_UI: "web"
+
       # ── Tool surface ─────────────────────────────────────────────────
       # Tool mode: "standard" (12 tools) or "hyperfocused" (1 universal
       # SAP tool, ~200 tokens — useful for token-tight clients).

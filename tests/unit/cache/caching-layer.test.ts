@@ -119,6 +119,72 @@ describe('CachingLayer', () => {
       expect(fetcherV2).toHaveBeenCalledTimes(1);
     });
 
+    it('records source cache activity for UI inspection', async () => {
+      const fetcher = vi
+        .fn()
+        .mockResolvedValueOnce({ source: 'REPORT zprog.', etag: 'e1', notModified: false, statusCode: 200 })
+        .mockResolvedValueOnce({ source: '', etag: 'e1', notModified: true, statusCode: 304 });
+
+      await layer.getSource('PROG', 'ZPROG', fetcher);
+      await layer.getSource('PROG', 'ZPROG', fetcher);
+      layer.invalidate('PROG', 'ZPROG');
+
+      const activity = layer.listActivity();
+
+      expect(activity.counts).toMatchObject({
+        source_miss: 1,
+        source_store: 1,
+        source_hit: 1,
+        source_invalidate: 1,
+      });
+      expect(activity.items.map((item) => item.event)).toEqual([
+        'source_invalidate',
+        'source_hit',
+        'source_store',
+        'source_miss',
+      ]);
+      expect(activity.items[0]).toMatchObject({
+        objectType: 'PROG',
+        objectName: 'ZPROG',
+        version: 'active',
+        removed: 1,
+      });
+      expect(activity.items[2]).toMatchObject({
+        objectType: 'PROG',
+        objectName: 'ZPROG',
+        version: 'active',
+        sourceLength: 'REPORT zprog.'.length,
+        etagPresent: true,
+        detail: 'loaded from SAP',
+      });
+      expect(activity.items[3]).toMatchObject({
+        objectType: 'PROG',
+        objectName: 'ZPROG',
+        version: 'active',
+        detail: 'no cached source entry',
+      });
+      expect(activity.items[3]).not.toHaveProperty('sourceLength');
+    });
+
+    it('can disable source cache activity recording', async () => {
+      const silentLayer = new CachingLayer(new MemoryCache(), 0);
+      const fetcher = vi.fn().mockResolvedValue({
+        source: 'REPORT zsilent.',
+        etag: 'e1',
+        notModified: false,
+        statusCode: 200,
+      });
+
+      await silentLayer.getSource('PROG', 'ZSILENT', fetcher);
+      silentLayer.invalidate('PROG', 'ZSILENT');
+
+      expect(silentLayer.listActivity()).toMatchObject({
+        total: 0,
+        counts: {},
+        items: [],
+      });
+    });
+
     it('invalidate(type, name) defaults to active version', async () => {
       cache.putSource('PROG', 'ZTEST', 'active');
       cache.putSource('PROG', 'ZTEST', 'inactive', { version: 'inactive' });

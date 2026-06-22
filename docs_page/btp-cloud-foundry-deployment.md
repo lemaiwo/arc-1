@@ -108,7 +108,7 @@ modules:
       SAP_ALLOWED_PACKAGES: "Z*,Y*,$TMP"
 ```
 
-The full set of overridable properties is documented in [`mta-overrides.mtaext.example`](https://github.com/arc-mcp/arc-1/blob/main/mta-overrides.mtaext.example): destinations, all `SAP_ALLOW_*` safety flags, `SAP_DENY_ACTIONS`, `SAP_PP_STRICT`, `ARC1_PUBLIC_URL` (for reverse-proxy deployments), `ARC1_ALLOWED_ORIGINS` (CORS), `ARC1_TOOL_MODE`, cache warmup, and `ARC1_LOG_HTTP_DEBUG`. Any property left out of the override falls back to the `mta.yaml` value.
+The full set of overridable properties is documented in [`mta-overrides.mtaext.example`](https://github.com/arc-mcp/arc-1/blob/main/mta-overrides.mtaext.example): destinations, all `SAP_ALLOW_*` safety flags, `SAP_DENY_ACTIONS`, `SAP_PP_STRICT`, `ARC1_PUBLIC_URL` (for reverse-proxy deployments), `ARC1_ALLOWED_ORIGINS` (CORS), `ARC1_UI`, `ARC1_TOOL_MODE`, cache warmup, and `ARC1_LOG_HTTP_DEBUG`. Any property left out of the override falls back to the `mta.yaml` value.
 
 See the [BTP Destination Setup Guide](btp-destination-setup.md) for creating the destinations themselves.
 
@@ -176,6 +176,7 @@ The base `mta.yaml` already configures these properties (override any of them vi
 - `SAP_PP_ENABLED: "true"` — per-user principal propagation
 - `SAP_XSUAA_AUTH: "true"` — XSUAA OAuth for MCP clients
 - `SAP_ALLOW_*: "false"` and `SAP_ALLOWED_PACKAGES: "$TMP"` — safe defaults; widen only as needed
+- `ARC1_UI: "off"` — experimental UI is not enabled by default. Set `ARC1_UI: "web"` in `mta-overrides.mtaext` or via `cf set-env` to mount the read-only console at `/ui`; HTTP UI mode requires XSUAA, OIDC, or an admin API key and every `/ui/*` request requires admin scope.
 
 ### 4. Verify a healthy startup
 
@@ -380,6 +381,22 @@ cf restage arc1-mcp-server
 ```
 
 Origins are comma-separated and must match exactly (no wildcards), because CORS responses are sent with `credentials: true`. Disallowed origins emit a `cors_rejected` audit event for triage. Full reference: [Security Guide §11](security-guide.md#11-network-security).
+
+**Read-only UI.** This is experimental and off by default. Direct ARC-1 backend access at `https://<arc1-app>/ui/` is protected with bearer auth, so a normal browser address-bar request returns `401`. For browser access, deploy the optional SAP AppRouter module shipped in this repo. AppRouter handles the interactive XSUAA login, checks the ARC-1 admin scope, and forwards the user JWT to ARC-1.
+
+```bash
+# One-time per landscape, after creating mta-overrides.mtaext as described above:
+npm run btp:build-deploy-ui-ext
+
+# Find the browser-facing route:
+cf app arc1-ui-router
+```
+
+Open the `arc1-ui-router` route in the browser. `/` and `/ui/` both lead to the UI. The signed-in user must be assigned the `ARC-1 Admin (<space>)` role collection; non-admin users are blocked by AppRouter before the request reaches ARC-1.
+
+The extension file [`mta-ui-approuter.mtaext`](../mta-ui-approuter.mtaext) does two things: sets `ARC1_UI=web` on `arc1-mcp-server`, and activates the otherwise-excluded `arc1-ui-router` module. `npm run btp:deploy-ui-ext` first writes an ignored `mta-ui-deploy.mtaext` by merging your local `mta-overrides.mtaext` with that UI activation, then deploys with the generated single extension descriptor. This keeps landscape-specific values (destinations, route host, `xsappname`) intact on CF deploy plugins that only apply one extension file reliably. The base `mta.yaml` keeps the AppRouter excluded from Cloud Foundry builds, so default deployments still create only the ARC-1 backend app.
+
+For stricter network privacy, map the AppRouter to an internal/private route or put it behind your corporate access layer. The v1 UI is read-only and does not expose cached source bodies.
 
 ## How BTP Connectivity Works
 

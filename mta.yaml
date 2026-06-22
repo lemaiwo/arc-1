@@ -118,12 +118,19 @@ modules:
       SAP_ALLOW_TRANSPORT_WRITES: "false"
       SAP_ALLOW_GIT_WRITES: "false"
       SAP_ALLOWED_PACKAGES: "$TMP"
+      # Experimental read-only UI. Keep off in the base descriptor; opt in
+      # per landscape with ARC1_UI=web in mta-overrides.mtaext.
+      ARC1_UI: "off"
       # CORS — empty (default) disables CORS entirely. Set per landscape via
       # `mta-overrides.mtaext` or `cf set-env` only when a browser UI talks to
       # /mcp directly. Native MCP clients (Claude Desktop, Cursor, VS Code,
       # Copilot Studio) don't need this. Comma-separated, exact match, no
       # wildcards.
       ARC1_ALLOWED_ORIGINS: ""
+    provides:
+      - name: arc1-mcp-api
+        properties:
+          url: ${default-url}
     requires:
       - name: arc1-xsuaa
       - name: arc1-destination
@@ -131,6 +138,33 @@ modules:
       # Bound only when the (deprecated) application-logs resource is active —
       # off by default; skipped automatically while inactive. See resource below.
       - name: arc1-application-logs
+
+  # Optional browser entry point for the experimental read-only UI. It is
+  # excluded by default so the base MTA still deploys one CF app. Include it
+  # with `mta-ui-approuter.mtaext`; the AppRouter performs interactive XSUAA login,
+  # checks the admin scope, and forwards the user JWT to `/ui/*` on ARC-1.
+  - name: arc1-ui-router
+    type: approuter.nodejs
+    path: btp/approuter
+    build-parameters:
+      builder: custom
+      commands: []
+      supported-platforms: []
+      ignore:
+        - node_modules/
+    parameters:
+      memory: 128M
+      disk-quota: 256M
+      instances: 1
+      buildpack: nodejs_buildpack
+    requires:
+      - name: arc1-xsuaa
+      - name: arc1-mcp-api
+        group: destinations
+        properties:
+          name: arc1-backend
+          url: ~{url}
+          forwardAuthToken: true
 
 resources:
   - name: arc1-xsuaa
