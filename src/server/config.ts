@@ -526,7 +526,24 @@ export function resolveConfig(args: string[]): { config: ServerConfig; sources: 
 
   // ── Principal Propagation ──────────────────────────────────────────
   config.ppEnabled = resolveBool('pp-enabled', 'SAP_PP_ENABLED', false, 'ppEnabled');
-  config.ppStrict = resolveBool('pp-strict', 'SAP_PP_STRICT', false, 'ppStrict');
+  const ppStrictFlag = getFlag('pp-strict');
+  const ppStrictEnv = process.env.SAP_PP_STRICT;
+  if (ppStrictFlag !== undefined && ppStrictFlag !== '') {
+    config.ppStrict = ppStrictFlag === 'true' || ppStrictFlag === '1';
+    config.ppStrictExplicit = true;
+    sources.ppStrict = { flag: '--pp-strict' };
+  } else if (ppStrictEnv !== undefined && ppStrictEnv !== '') {
+    config.ppStrict = ppStrictEnv === 'true' || ppStrictEnv === '1';
+    config.ppStrictExplicit = true;
+    sources.ppStrict = { env: 'SAP_PP_STRICT' };
+  } else {
+    // Principal propagation should fail closed on JWT propagation failures by default.
+    // Non-JWT API-key/stdio requests keep using the shared client unless strict mode
+    // is explicitly enabled with SAP_PP_STRICT=true / --pp-strict true.
+    config.ppStrict = config.ppEnabled;
+    config.ppStrictExplicit = false;
+    sources.ppStrict = 'default';
+  }
   config.ppAllowSharedCookies = resolveBool(
     'pp-allow-shared-cookies',
     'SAP_PP_ALLOW_SHARED_COOKIES',

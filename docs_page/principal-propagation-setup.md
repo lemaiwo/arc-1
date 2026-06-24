@@ -115,25 +115,26 @@ Verify these profile parameters (transaction `/nRZ10`):
 export SAP_BTP_DESTINATION=SAP_TRIAL
 export SAP_BTP_PP_DESTINATION=SAP_TRIAL_PP
 export SAP_PP_ENABLED=true
-export SAP_PP_STRICT=true
+# Optional JWT-only strict mode:
+# export SAP_PP_STRICT=true
 ```
 
 ### Behavior
 
 - **JWT request** → ARC-1 uses the per-user destination (`SAP_BTP_PP_DESTINATION`), passing the JWT as `X-User-Token`
-- **PP failure + `SAP_PP_STRICT=false`** (default) → falls back to shared destination
-- **PP failure + `SAP_PP_STRICT=true`** → returns error, no fallback
-- **API key / non-JWT request** → uses shared destination
+- **PP failure + default strict mode** → returns error, no fallback
+- **PP failure + explicit `SAP_PP_STRICT=false`** → falls back to shared destination
+- **API key / non-JWT request** → uses shared destination unless `SAP_PP_STRICT=true` was set explicitly
 
-!!! danger "Set `SAP_PP_STRICT=true` on any multi-user instance"
-    With the default `SAP_PP_STRICT=false`, a per-user PP failure (destination error, missing CERTRULE mapping, untrusted JWT issuer) **silently falls back to the shared service account**. The request then runs with the technical user's full authorizations and SAP audits it as that technical user — not the real caller. An attacker who can force PP to fail escalates to the shared account and defeats the per-user audit trail this setup exists to provide. Keep the fallback only for mixed API-key deployments; for a per-user instance set `SAP_PP_STRICT=true`.
+!!! warning "Use `SAP_PP_STRICT=false` only for intentional mixed-mode fallback"
+    With `SAP_PP_ENABLED=true`, ARC-1 fails closed by default when per-user PP fails. Setting `SAP_PP_STRICT=false` restores the shared-service-account fallback for JWT PP failures: the request then runs with the technical user's authorizations and SAP audits the technical user, not the human. Keep this only for deployments that intentionally mix fallback shared-client access with PP.
 
 ### All PP-related config
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
 | `--pp-enabled` | `SAP_PP_ENABLED` | `false` | Enable principal propagation |
-| `--pp-strict` | `SAP_PP_STRICT` | `false` | Fail on PP errors (no fallback) |
+| `--pp-strict` | `SAP_PP_STRICT` | `true` when PP is enabled | Fail on JWT PP errors by default. Set explicitly to `false` only for shared-client fallback on PP failure. Set explicitly to `true` only when API-key / non-JWT requests should also be rejected. |
 | `--pp-allow-shared-cookies` | `SAP_PP_ALLOW_SHARED_COOKIES` | `false` | Escape hatch — allow cookies to coexist with PP (cookies stay on shared client only) |
 | — | `SAP_BTP_DESTINATION` | — | Shared (fallback) destination name |
 | — | `SAP_BTP_PP_DESTINATION` | — | Per-user PP destination name |
