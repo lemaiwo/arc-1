@@ -89,9 +89,10 @@ export const TOOL_SCHEMA_SCENARIOS: ToolSchemaScenario[] = [
       // +90/+60/+1 for the set_api_state `contract` param (C0–C4 enum + per-type docs).
       // +1 descriptionCount for SAPDiagnose `coverage` param (FEAT-41 AUnit coverage).
       // +~590/+440/+7 for SAPDiagnose trace_start/trace_requests/trace_cancel actions + their params.
-      schemaTokenEstimate: 13_047,
-      descriptionTokenEstimate: 10_289,
-      descriptionCount: 162,
+      // +odata_perf/cds_sql actions + `url` param (PR #509 OData/SQL perf-insight).
+      schemaTokenEstimate: 13_550,
+      descriptionTokenEstimate: 10_750,
+      descriptionCount: 164,
     },
   },
   {
@@ -107,9 +108,10 @@ export const TOOL_SCHEMA_SCENARIOS: ToolSchemaScenario[] = [
       // +1 descriptionCount / ~60 desc tokens for SAPDiagnose `coverage` param (FEAT-41).
       // +TTYP read/write type + SAPWrite rowType/rowTypeKind params (FEAT-65).
       // +~570/+460/+6 for SAPDiagnose trace_start/trace_requests/trace_cancel actions + their params.
-      schemaTokenEstimate: 21_237,
-      descriptionTokenEstimate: 16_240,
-      descriptionCount: 279,
+      // +odata_perf/cds_sql actions + `url` param (PR #509 OData/SQL perf-insight).
+      schemaTokenEstimate: 21_750,
+      descriptionTokenEstimate: 16_700,
+      descriptionCount: 281,
     },
   },
   {
@@ -127,9 +129,10 @@ export const TOOL_SCHEMA_SCENARIOS: ToolSchemaScenario[] = [
       // +1 descriptionCount / ~60 desc tokens for SAPDiagnose `coverage` param (FEAT-41).
       // +SAPWrite rowType/rowTypeKind params (FEAT-65; global SAPWrite props, present on BTP too).
       // +~570/+460/+4 for SAPDiagnose trace_start/trace_requests/trace_cancel actions + their params.
-      schemaTokenEstimate: 19_480,
-      descriptionTokenEstimate: 14_593,
-      descriptionCount: 277,
+      // +odata_perf/cds_sql actions + `url` param (PR #509 OData/SQL perf-insight).
+      schemaTokenEstimate: 19_980,
+      descriptionTokenEstimate: 15_050,
+      descriptionCount: 279,
     },
   },
   {

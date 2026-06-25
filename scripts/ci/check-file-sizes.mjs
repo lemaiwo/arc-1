@@ -30,9 +30,13 @@ const BUDGETS = {
   // submodules ride the default src budget; keep this tight so the dispatcher can't reabsorb them.
   'src/handlers/write.ts': 360,
   // tools.ts holds every tool's JSON schema; FEAT-65 (TTYP) + set_api_state's contract/apiState params
-  // + the SAPDiagnose trace_start/trace_requests/trace_cancel actions nudged it up. Trim before raising.
-  'src/handlers/tools.ts': 1759,
+  // + the SAPDiagnose trace_start/trace_requests/trace_cancel + odata_perf/cds_sql actions nudged it up.
+  // Trim before raising.
+  'src/handlers/tools.ts': 1770,
   'src/adt/xml-parser.ts': 1650,
+  // diagnostics.ts gained the ABAP trace-request engine (#508) + the OData perf probe + CDS Show-SQL (#509).
+  // Split out a perf/trace module if it grows much further.
+  'src/adt/diagnostics.ts': 1710,
   // The ADT client facade aggregates every read/write op; set_api_state (#506) + runQueryWithMetrics
   // (SAPQuery metrics, this PR) pushed it past the default. Keep tight headroom.
   'src/adt/client.ts': 1560,

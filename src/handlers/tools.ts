@@ -1173,7 +1173,9 @@ export function getToolDefinitions(
         '- "trace_requests": List armed (not-yet-consumed) trace requests for a user (default the connected user) — to confirm a request is armed or find a stale one to cancel.\n' +
         '- "trace_cancel": Cancel an armed trace request by id (from trace_start or trace_requests). Write scope.\n\n' +
         '- "system_messages": List SM02 system messages via ADT feed (filter by user, maxResults, from, to).\n' +
-        '- "gateway_errors": List SAP Gateway error log entries (/IWFND/ERROR_LOG, on-prem). For detail mode provide detailUrl (preferred) or id+errorType.\n\n' +
+        '- "gateway_errors": List SAP Gateway error log entries (/IWFND/ERROR_LOG, on-prem). For detail mode provide detailUrl (preferred) or id+errorType.\n' +
+        '- "odata_perf": Diagnose WHY a Fiori/OData request is slow. Requires url (the host-relative OData path from the app\'s Network tab). ARC-1 GETs it with ?sap-statistics=true and a wall-clock timer, then returns the server-side timing split (gwtotal, gwapp, gwappdb=DB time, gwfw=framework, icfauth=auth) plus a verdict routing you to the dominant cost (DB vs ABAP/SADL vs framework vs auth). Read-only GET; gated like data preview.\n' +
+        '- "cds_sql": Show the native SQL a CDS view compiles to (ADT "Show SQL Create Statement"). Requires name (the CDS DDL source / DDLS, e.g. "I_CURRENCY"). Returns the CREATE VIEW statement(s) so you can see the joins/scans behind a slow entity. Read-only; may be unavailable on older releases (e.g. NW 7.50).\n\n' +
         'Quickfix workflow: run syntax/ATC first to identify issues and line positions, then call quickfix to retrieve SAP-verified proposals, then apply_quickfix to get exact text deltas, and finally write the updated source via SAPWrite.',
       inputSchema: {
         type: 'object',
@@ -1195,13 +1197,20 @@ export function getToolDefinitions(
               'object_state',
               'quickfix',
               'apply_quickfix',
+              'odata_perf',
+              'cds_sql',
             ],
             description: 'Diagnostic action',
           },
           name: {
             type: 'string',
             description:
-              'Object name (for syntax/unittest/atc/object_state); the CDS entity / DDLS source name for cds_testcases',
+              'Object name (for syntax/unittest/atc/object_state); the CDS entity / DDLS source name for cds_testcases and cds_sql',
+          },
+          url: {
+            type: 'string',
+            description:
+              'For action="odata_perf": the host-relative OData path to probe, copied from the Fiori app\'s Network tab (e.g. "/sap/opu/odata4/sap/.../Entity?$filter=..." or "/sap/opu/odata/sap/<SRV>/<EntitySet>?$top=20"). Must be a path on the SAP system ARC-1 connects to — absolute URLs are rejected.',
           },
           type: {
             type: 'string',
