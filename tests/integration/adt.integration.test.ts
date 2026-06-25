@@ -2667,3 +2667,51 @@ describe('Self-correcting unknown-column hint (FEAT-64)', () => {
     expectHintOrGraceful(result);
   });
 });
+
+// ─── ABAP Unit coverage (FEAT-41) ─────────────────────────────────────
+// The coverage measurement endpoint is standard ADT, live-verified on 7.50 + 758 + 816 (2026-06-25 —
+// identical {stmt 3/4, branch 2/3, proc 1/1} for a controlled tested class on each). This CI test
+// targets ZCL_ABAPGIT_HASH (758: stmt 61% / branch 36% / proc 38%); abapGit classes carry unit tests
+// on 758 but are absent on a4h-2025/816 + NPL 7.50, so it skips cleanly there (NOT a coverage gap).
+describe('AUnit coverage (FEAT-41)', () => {
+  it('unittest coverage=true returns statement/branch/procedure for a class with tests', async (ctx) => {
+    requireOrSkip(ctx, process.env.TEST_SAP_URL, SkipReason.NO_CREDENTIALS);
+    const { handleToolCall } = await import('../../src/handlers/dispatch.js');
+    const config = {
+      arc1Port: 8080,
+      arc1HttpAddr: '0.0.0.0:8080',
+      toolMode: 'standard',
+    } as unknown as Parameters<typeof handleToolCall>[1];
+    const result = await handleToolCall(getTestClient(), config, 'SAPDiagnose', {
+      action: 'unittest',
+      type: 'CLAS',
+      name: 'ZCL_ABAPGIT_HASH',
+      coverage: true,
+    });
+    expect(result.isError).toBeUndefined();
+    const out = JSON.parse(result.content[0]?.text ?? '{}') as {
+      tests?: unknown[];
+      coverage?: {
+        statement?: { total: number };
+        branch?: unknown;
+        procedure?: unknown;
+        methodsBelowFull?: Array<{ method: string; statement?: { percent: number } }>;
+      };
+    };
+    requireOrSkip(
+      ctx,
+      Array.isArray(out.tests) && out.tests.length > 0 ? true : undefined,
+      `${SkipReason.NO_FIXTURE} (no ZCL_ABAPGIT_HASH unit tests on this system)`,
+    );
+    expect(out.coverage?.statement?.total).toBeGreaterThan(0);
+    expect(out.coverage?.branch).toBeDefined();
+    expect(out.coverage?.procedure).toBeDefined();
+    // Per-method drill-down: ZCL_ABAPGIT_HASH has partially-covered methods (it isn't fully tested),
+    // worst-first by statement percent. (Skips elsewhere; method node type is CLAS/OM on 758/816 and
+    // CLAS/OM/<visibility> on 7.50 — both matched.)
+    const below = out.coverage?.methodsBelowFull ?? [];
+    expect(below.length).toBeGreaterThan(0);
+    const pcts = below.map((m) => m.statement?.percent ?? 0);
+    expect(pcts).toEqual([...pcts].sort((a, b) => a - b));
+  }, 60_000);
+});
