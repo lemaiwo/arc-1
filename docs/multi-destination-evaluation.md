@@ -153,10 +153,62 @@ maintain. This is the pragmatic stopgap until Option A exists.
 | 8 | Decide concurrency scope: keep `ARC1_MAX_CONCURRENT` global (protects instance memory) but consider per-destination sub-limits so one slow system can't starve the others | `server/server.ts` | S |
 | 9 | Warmup per destination (`ARC1_CACHE_WARMUP_<DEST>`), sequential to bound startup cost | `cache/warmup.ts` | S |
 | 10 | stdio transport stays single-destination (multi-dest is an HTTP-deployment feature) | — | — |
+| 11 | Optional: destination-scoped API keys (`ARC1_API_KEYS="key:profile@S4D,S4Q"`) so a key can be limited to specific systems (see §6) | `server/config.ts`, `server/http.ts` | S |
 
 Rough total: a focused ~1–2 week effort including tests, dominated by items 2–4.
 
-## 6. Recommended path
+## 6. Per-destination authorization & guardrails
+
+The design covers authorization per system. ARC-1 (0.9.x) enforces three layers, and
+Option A makes the first one destination-scoped:
+
+**Layer 1 — Safety ceiling (per destination in Option A).** Today these are global
+process env vars; in the registry each destination gets its own ceiling:
+
+| Guardrail | Global (today) | Per destination (Option A) |
+|-----------|----------------|----------------------------|
+| Writes | `SAP_ALLOW_WRITES` | `SAP_ALLOW_WRITES_S4D=true`, prod stays read-only |
+| Data preview | `SAP_ALLOW_DATA_PREVIEW` | e.g. allow on QA, deny on prod |
+| Free SQL | `SAP_ALLOW_FREE_SQL` | dev only |
+| Transport writes | `SAP_ALLOW_TRANSPORT_WRITES` | dev/QA only |
+| abapGit writes | `SAP_ALLOW_GIT_WRITES` | dev only |
+| Package allowlist | `SAP_ALLOWED_PACKAGES` | `SAP_ALLOWED_PACKAGES_S4D="ZTEAM*"` |
+| Transport allowlist | `SAP_ALLOWED_TRANSPORTS` | per system |
+| Per-action denials | `SAP_DENY_ACTIONS` (e.g. `SAPWrite.delete,SAPManage.flp_*`) | per system |
+
+Because each destination is its own MCP endpoint, the tool *listing* also reflects its
+ceiling — a read-only prod endpoint doesn't even advertise write tools, so the LLM
+cannot attempt them.
+
+**Layer 2 — Per-caller narrowing (already works, composes unchanged).** On every tool
+call, 0.9.x intersects the client's safety config with the caller's rights via
+`client.withSafety(...)`:
+
+- **API-key profiles** (`ARC1_API_KEYS="key:profile"`, profiles `viewer`,
+  `viewer-data`, `viewer-sql`, `developer`, `developer-data`, `developer-sql`,
+  `admin`) — `deriveUserSafetyFromProfile` intersects flags AND-wise and narrows the
+  package allowlist (wildcard/subtree-aware, conservative on `**` patterns).
+- **XSUAA/OIDC scopes** (`read`/`write`/`data`/`sql`/`transports`/`git`/`admin`) —
+  `deriveUserSafety` can only tighten the ceiling, never widen it.
+
+Since the narrowing runs against whatever client handles the request, it applies per
+destination for free: **effective rights = destination ceiling ∩ caller profile/scopes.**
+Example: a `developer` API key on `/mcp/S4D` can write to `ZTEAM*`; the same key on
+`/mcp/S4P` is read-only because prod's ceiling has `allowWrites=false`.
+
+One gap to decide on: API keys and XSUAA config are instance-wide — any valid key can
+*reach* every destination endpoint (with that destination's ceiling applied). If keys
+should be restricted to specific systems, extend the key syntax, e.g.
+`ARC1_API_KEYS="key1:developer@S4D,S4Q;key2:viewer@*"` — a small addition to the
+registry lookup (work item 11).
+
+**Layer 3 — SAP-side authorization (inherently per system).** Each destination has its
+own technical user (BasicAuth destination) whose SAP roles are the hard backstop — a
+prod destination user with display-only roles caps everything above. With principal
+propagation, each system maps the *end user* via its own Cloud Connector/CERTRULE
+setup, so real SAP authorizations (S_DEVELOP etc.) apply per user, per system.
+
+## 7. Recommended path
 
 1. **Sync the fork** to upstream `arc-mcp/arc-1` main (fast-forward; migrate any local
    `.env`/deployment config across the 0.7 breaking changes using upstream's
