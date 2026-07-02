@@ -1,0 +1,168 @@
+# Evaluation: Multiple BTP Destinations in One ARC-1 Instance
+
+**Date:** 2026-07-02
+**Fork state:** `lemaiwo/arc-1` main = v0.4.4 (last synced ~2026-04-08)
+**Upstream state:** v0.9.24 (published 2026-07-01), repo moved to `arc-mcp/arc-1`
+
+## TL;DR
+
+- **Upstream sync:** The fork is ~25 releases behind (0.4.4 → 0.9.24). Upstream moved
+  from `marianfoo/arc-1` to `arc-mcp/arc-1`. Syncing could not be done from this
+  session (repo access is scoped to `lemaiwo/arc-1` only); use GitHub's **Sync fork**
+  button or fetch upstream locally.
+- **Multi-destination:** Neither 0.4.4 nor 0.9.24 supports more than one SAP system per
+  instance today. However, the architecture is already ~80% ready: tool dispatch takes
+  an `AdtClient` per call, per-request client construction already exists (principal
+  propagation), and the HTTP transport is stateless (a fresh MCP `Server` per request).
+  **A path-per-destination design (`/mcp/<destination>`) is feasible with moderate,
+  contained effort.**
+- **Recommendation:** Sync to upstream 0.9.x first, then implement multi-destination
+  there (ideally as an upstream contribution). Implementing on 0.4.4 means rebuilding
+  it after every future sync and absorbing the 0.7 breaking config changes anyway.
+
+---
+
+## 1. Upstream gap (0.4.4 → 0.9.24)
+
+Changes since the fork's version that matter for this feature:
+
+| Area | Change |
+|------|--------|
+| Repo | Moved to `github.com/arc-mcp/arc-1` |
+| Auth/config (**breaking**, v0.7) | `SAP_READ_ONLY`/`SAP_BLOCK_*`/`SAP_ENABLE_*` replaced by positive opt-ins (`SAP_ALLOW_WRITES`, `SAP_ALLOW_DATA_PREVIEW`, …); `SAP_ALLOWED_OPS`/`SAP_DISALLOWED_OPS` → `SAP_DENY_ACTIONS`; single `ARC1_API_KEY` → `ARC1_API_KEYS="key:profile"` with per-key authorization profiles (`viewer`…`admin`). Startup **fails hard** if legacy vars are set. |
+| BTP/destination logic | Extracted from `src/adt/btp.ts` into a separate package `@arc-mcp/xsuaa-auth` (`lookupDestinationWithUserToken`, proxy selection, etc.) |
+| Per-request safety | `client.withSafety(...)` derives an effective per-user client from API-key profile or OIDC scopes on every tool call |
+| Concurrency | `ARC1_MAX_CONCURRENT` server-wide semaphore shared across all clients |
+| New surfaces | Plugin system (`Custom_*` tools), web UI, rate limiting (`ARC1_AUTH_RATE_LIMIT`), OAuth DCR, abapGit, startup probes (textSearch smoketest, auth preflight) |
+
+The fork has no local commits beyond upstream history, so a sync is a fast-forward:
+
+```bash
+git remote add upstream https://github.com/arc-mcp/arc-1.git
+git fetch upstream
+git checkout main && git merge --ff-only upstream/main
+git push origin main
+```
+
+(Or simply the **Sync fork** button on github.com/lemaiwo/arc-1.)
+
+## 2. Current architecture: one instance = one system
+
+Both in the fork (0.4.4) and upstream (0.9.24):
+
+1. **Startup resolution mutates global config.** `SAP_BTP_DESTINATION` is resolved once
+   at startup and overwrites `config.url/username/password/client`
+   (`src/server/server.ts:409` in the fork). One shared `defaultClient` is built from it.
+2. **Cache keys have no system dimension.** Object cache keys are
+   `TYPE:NAME:version` (`src/cache/cache.ts`); the SQLite schema (`nodes`, `edges`,
+   `sources`, …) has no system/destination column. Two systems in one cache would
+   collide silently.
+3. **Feature probe + ADT discovery are process singletons.** System type detection
+   (BTP vs on-prem), textSearch availability, and the discovery MIME map are cached
+   module-globally and drive the tool listing.
+4. **`SAP_BTP_PP_DESTINATION` is not multi-system.** The dual-destination setup is two
+   destinations pointing at the *same* backend (shared BasicAuth + per-user
+   PrincipalPropagation), not two systems.
+
+## 3. What already works in favor of multi-destination
+
+1. **Tool dispatch is client-agnostic.** Every call goes through
+   `handleToolCall(effectiveClient, config, toolName, args, …)` — the client is a
+   parameter, not a global.
+2. **Per-request client construction is proven.** The principal-propagation path
+   (`createPerUserClient`) already looks up a BTP destination *at request time*,
+   selects the correct Cloud Connector proxy per destination
+   (`selectPerUserProxy` handles per-destination `CloudConnectorLocationId`), and
+   builds a fresh `AdtClient` per request.
+3. **The HTTP transport is stateless.** Each `POST /mcp` creates a fresh MCP
+   `Server` + `StreamableHTTPServerTransport` from a `serverFactory()` closure
+   (`src/server/http.ts`). Mounting *N* factories at *N* paths is a small change.
+4. **Per-request safety derivation exists** (0.9.x): `client.withSafety(...)` — the
+   same mechanism can carry per-destination policies (e.g. writes on DEV only).
+
+## 4. Design options
+
+### Option A — Path-per-destination endpoints (recommended)
+
+```
+SAP_BTP_DESTINATIONS=S4D,S4Q,S4P        # allowlist of Destination Service names
+
+https://arc1.cfapps.../mcp/S4D   → dev system
+https://arc1.cfapps.../mcp/S4Q   → qa system
+https://arc1.cfapps.../mcp/S4P   → prod system
+https://arc1.cfapps.../mcp       → default (first entry / SAP_BTP_DESTINATION), back-compat
+```
+
+Each destination is registered in the MCP client (Claude/Copilot) as its **own MCP
+server entry**. Consequences:
+
+- **No tool schema changes** — the LLM never has to pass a "system" parameter and can
+  never write to prod because it hallucinated the wrong system ID.
+- **Tool listing stays correct per system** — BTP vs on-prem feature differences are
+  probed per destination.
+- **Per-destination safety** — e.g. `SAP_ALLOW_WRITES_S4D=true` while S4P stays
+  read-only. Deny-by-default for anything not in the allowlist.
+
+Implementation sketch (a `DestinationRegistry`):
+
+```
+Map<destName, {
+  adtClient        // shared client, resolved lazily on first request, re-resolved on 401/TTL
+  bearerProvider   // OAuth lifecycle if service-key based
+  btpProxy         // per-destination Cloud Connector config
+  features         // feature probe result (system type, textSearch, …)
+  discoveryMap     // ADT discovery MIME map
+  cachingLayer     // per-destination cache (see below)
+  safety           // per-destination ceiling
+}>
+```
+
+`startHttpServer` mounts one `createMcpHandler(serverFactoryFor(dest))` per registry
+entry.
+
+### Option B — `system` argument on every tool (not recommended)
+
+Add a `system` parameter to all 11 tool schemas. Rejected because: schema churn on all
+tools, the LLM must reliably pass the right system (prod-write risk), mixed
+BTP/on-prem tool listings become ambiguous, and hyperfocused mode gets more complex.
+
+### Option C — Header/session-based routing (not recommended)
+
+An `X-ARC1-Destination` header per session. The Streamable HTTP transport runs in
+stateless mode (no session), and most MCP clients make custom per-server headers
+awkward. Option A achieves the same isolation with plain URLs.
+
+### Option D — Zero-code alternative: N instances (works today)
+
+One CF app (or one process) per destination. With `ARC1_*`/`SAP_*` env per app this
+works unmodified right now; a single `mta.yaml` can declare N modules sharing one
+destination-service instance. Cost: N × ~100–150 MB memory and N deployments to
+maintain. This is the pragmatic stopgap until Option A exists.
+
+## 5. Work items for Option A (on top of 0.9.x)
+
+| # | Item | Where (0.9.x layout) | Size |
+|---|------|----------------------|------|
+| 1 | `SAP_BTP_DESTINATIONS` config + optional per-dest overrides (`SAP_ALLOW_WRITES_<DEST>`, `SAP_ALLOWED_PACKAGES_<DEST>`) | `server/config.ts` | S |
+| 2 | `DestinationRegistry` with lazy init + credential re-resolution on 401/TTL (startup-once resolution is already a latent staleness bug for long-running instances) | new `server/destination-registry.ts`, reuse `@arc-mcp/xsuaa-auth` | M |
+| 3 | Feature cache + discovery map keyed by destination (currently module-global in `handlers/feature-cache.ts`) | `handlers/feature-cache.ts`, `server/server.ts` | S–M |
+| 4 | Cache isolation: per-destination cache file (`.arc1-cache-<dest>.db`) **or** a `system` column/key prefix. Separate files are simpler and make eviction trivial | `cache/*` | M |
+| 5 | Mount `/mcp/:dest` routes; keep `/mcp` for back-compat; shared MCP auth (API keys / XSUAA) across routes | `server/http.ts` | S |
+| 6 | PP per destination: convention `<DEST>_PP` or explicit map, replacing the single `SAP_BTP_PP_DESTINATION` | `server/server.ts` | S |
+| 7 | Audit events include destination (field already exists on PP events — extend to all) | `server/audit.ts` | S |
+| 8 | Decide concurrency scope: keep `ARC1_MAX_CONCURRENT` global (protects instance memory) but consider per-destination sub-limits so one slow system can't starve the others | `server/server.ts` | S |
+| 9 | Warmup per destination (`ARC1_CACHE_WARMUP_<DEST>`), sequential to bound startup cost | `cache/warmup.ts` | S |
+| 10 | stdio transport stays single-destination (multi-dest is an HTTP-deployment feature) | — | — |
+
+Rough total: a focused ~1–2 week effort including tests, dominated by items 2–4.
+
+## 6. Recommended path
+
+1. **Sync the fork** to upstream `arc-mcp/arc-1` main (fast-forward; migrate any local
+   `.env`/deployment config across the 0.7 breaking changes using upstream's
+   `docs_page/updating.md`).
+2. **Deploy Option D** (one instance per destination) if multi-system access is needed
+   immediately — zero code.
+3. **Implement Option A** on the synced fork, and consider proposing it upstream as a
+   feature PR — the per-request client machinery and stateless transport upstream
+   added since 0.5 make this a natural fit there.
