@@ -154,6 +154,7 @@ maintain. This is the pragmatic stopgap until Option A exists.
 | 9 | Warmup per destination (`ARC1_CACHE_WARMUP_<DEST>`), sequential to bound startup cost | `cache/warmup.ts` | S |
 | 10 | stdio transport stays single-destination (multi-dest is an HTTP-deployment feature) | — | — |
 | 11 | Optional: destination-scoped API keys (`ARC1_API_KEYS="key:profile@S4D,S4Q"`) so a key can be limited to specific systems (see §6) | `server/config.ts`, `server/http.ts` | S |
+| 12 | Optional: per-destination XSUAA scopes (`$XSAPPNAME.<DEST>.<scope>` or attribute-based) → BTP role collections per system (see §6.3) | `xs-security.json`, scope check in auth layer | S–M |
 
 Rough total: a focused ~1–2 week effort including tests, dominated by items 2–4.
 
@@ -207,6 +208,70 @@ own technical user (BasicAuth destination) whose SAP roles are the hard backstop
 prod destination user with display-only roles caps everything above. With principal
 propagation, each system maps the *end user* via its own Cloud Connector/CERTRULE
 setup, so real SAP authorizations (S_DEVELOP etc.) apply per user, per system.
+
+### 6.1 What moves from `mta.yaml` into the destinations?
+
+Split of responsibilities in the multi-destination setup:
+
+**Lives in each BTP destination** (this is already how `SAP_BTP_DESTINATION` works today):
+- `URL`, auth (`User`/`Password` for BasicAuth, or `PrincipalPropagation` type)
+- `ProxyType` (`OnPremise` → Cloud Connector, incl. `CloudConnectorLocationId`)
+- `sap-client` as an **additional property** — ARC-1 already reads it
+  (`resolveBTPDestination`, defaults to `100` when absent)
+
+**Stays in `mta.yaml` / app env:**
+- Service bindings (destination, connectivity, xsuaa services)
+- The allowlist `SAP_BTP_DESTINATIONS=S4D,S4Q,S4P` (deny-by-default routing)
+- Guardrail ceilings (`SAP_ALLOW_WRITES_<DEST>`, `SAP_ALLOWED_PACKAGES_<DEST>`, …)
+
+**System ID: nothing to configure.** The destination *name* is the identifier used for
+routing (`/mcp/S4D`), cache scoping, audit, and role checks — no SID property is
+needed. System type and capabilities (BTP vs on-prem, textSearch, …) are probed
+automatically per destination via ADT discovery on first use. Only `sap-client` must
+be set as a destination property if the client isn't 100.
+
+Guardrails *could* alternatively be stored as custom destination properties (e.g.
+`arc1.allow_writes=true` — the Destination Service returns arbitrary properties).
+Deliberately **not** recommended as the source of truth: anyone with destination-admin
+rights in the subaccount could then widen write access without a redeploy. If used at
+all, env vars should remain the ceiling and destination properties may only narrow.
+
+### 6.2 Cross-system calls
+
+Server-side: **no, by design.** One endpoint = one system; ARC-1 never proxies a
+request from one system's session to another, so there is no confused-deputy path and
+each system's audit log is self-contained.
+
+Cross-system *workflows* still work — at the agent layer. A user with access to both
+systems registers both endpoints (`/mcp/S4D`, `/mcp/S4P`) in their MCP client; the
+LLM reads from one server and writes via the other in the same conversation
+("compare this class between prod and dev", "replicate the fix"). Every call is
+authorized and audited independently per system, under that system's guardrails.
+
+A server-side cross-system tool (e.g. `SAPCompare` with an explicit target
+destination) is technically possible later but reopens the isolation question —
+defer unless a concrete need appears.
+
+### 6.3 BTP roles per system
+
+Today the XSUAA scopes (`read`, `write`, `data`, `sql`, `transports`, `git`,
+`admin`) are instance-wide. Two ways to make BTP role collections per system:
+
+1. **Scope-per-destination (recommended, simple):** declare
+   `$XSAPPNAME.S4D.write`, `$XSAPPNAME.S4P.read`, … in `xs-security.json`
+   (generated from the destination list at deploy time), with role templates per
+   system. BTP admins then assign role collections like *ARC1 Developer (S4D)* /
+   *ARC1 Viewer (S4P)* per user in the cockpit. The endpoint for destination D
+   accepts `D.<scope>` (falling back to un-prefixed global scopes for
+   back-compat). Adding a system requires an `xs-security.json` update + redeploy.
+2. **Attribute-based (dynamic):** one set of role templates with an XSUAA
+   attribute `systems`; role collections carry attribute values (`S4D,S4Q`), the
+   JWT exposes them via `xs.user.attributes`, and the endpoint checks
+   `destination ∈ systems`. No redeploy when adding systems, slightly more code.
+
+Independent of both: with principal propagation the backend applies the **actual SAP
+roles of the end user per system**, so BTP role collections gate tool access while
+S_DEVELOP & co. remain the authoritative object-level authorization in each system.
 
 ## 7. Recommended path
 
