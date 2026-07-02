@@ -18,6 +18,8 @@ export interface AuditEventBase {
   requestId?: string;
   user?: string;
   clientId?: string;
+  /** Multi-destination mode: the BTP destination the request was bound to. */
+  destination?: string;
 }
 
 /** MCP tool call started */

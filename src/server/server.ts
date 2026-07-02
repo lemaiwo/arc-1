@@ -191,7 +191,7 @@ export function logAuthSummary(config: ServerConfig): void {
 
   const hasCookie = !!(config.cookieFile || config.cookieString);
   const hasBearer = !!(config.btpServiceKey || config.btpServiceKeyFile);
-  const hasDestination = !!process.env.SAP_BTP_DESTINATION;
+  const hasDestination = !!process.env.SAP_BTP_DESTINATION || !!process.env.SAP_BTP_DESTINATIONS;
   const hasBasic = !!(config.username && config.password);
 
   let sapMethod = 'none';
@@ -303,6 +303,25 @@ export function selectPerUserProxy(
  * The Cloud Connector uses this header to generate an X.509 cert
  * mapped to the SAP user via CERTRULE.
  */
+/**
+ * Resolve the principal-propagation destination for a config.
+ *
+ * Multi-destination mode (config.destinationName set): the per-destination
+ * `arc1.pp_destination` property wins, else the destination itself — the
+ * global SAP_BTP_PP_DESTINATION env var deliberately does NOT apply, since it
+ * names a destination for ONE system and would leak across endpoints.
+ *
+ * Single-destination mode: the historical dual-destination env chain —
+ * SAP_BTP_PP_DESTINATION (PrincipalPropagation type, per-user runtime) with
+ * SAP_BTP_DESTINATION (BasicAuth, shared client) as fallback.
+ */
+export function resolvePpDestinationName(config: ServerConfig): string | undefined {
+  if (config.destinationName) {
+    return config.ppDestinationName ?? config.destinationName;
+  }
+  return process.env.SAP_BTP_PP_DESTINATION ?? process.env.SAP_BTP_DESTINATION;
+}
+
 async function createPerUserClient(
   config: ServerConfig,
   btpConfig: BTPConfig,
@@ -311,11 +330,7 @@ async function createPerUserClient(
   adtSemaphore?: Semaphore,
 ): Promise<AdtClient> {
   const { lookupDestinationWithUserToken } = await import('@arc-mcp/xsuaa-auth/btp');
-  // Use SAP_BTP_PP_DESTINATION if set, otherwise fall back to SAP_BTP_DESTINATION.
-  // This enables a dual-destination approach:
-  // - SAP_BTP_DESTINATION = BasicAuth destination (shared client, startup resolution)
-  // - SAP_BTP_PP_DESTINATION = PrincipalPropagation destination (per-user, runtime)
-  const destName = process.env.SAP_BTP_PP_DESTINATION ?? process.env.SAP_BTP_DESTINATION;
+  const destName = resolvePpDestinationName(config);
   if (!destName) {
     throw new Error('SAP_BTP_PP_DESTINATION or SAP_BTP_DESTINATION is required for principal propagation');
   }
@@ -455,7 +470,7 @@ export function runStartupProbe(
           );
         }
       }
-      setCachedFeatures(features);
+      setCachedFeatures(features, config.destinationName);
       // Proactive warning: on SAP_BASIS < 7.51 the ADT REST handler does not honor the
       // stateful-session header over HTTP, so object writes fail with 423 "invalid lock
       // handle" until the abapfs_extensions enhancement is installed. Warn at startup —
@@ -469,9 +484,9 @@ export function runStartupProbe(
             'installed and you can ignore this. See docs/sap-trial-setup.md (423 troubleshooting).',
         );
       }
-      setCachedDiscovery(features.discoveryMap ?? new Map());
+      setCachedDiscovery(features.discoveryMap ?? new Map(), config.destinationName);
     } catch {
-      setCachedDiscovery(new Map());
+      setCachedDiscovery(new Map(), config.destinationName);
       // Probe failed (e.g., SAP system unreachable) — continue with default tool set
     }
   })();
@@ -649,7 +664,7 @@ export function createServer(
     if (startupProbePromise) {
       await Promise.race([startupProbePromise, new Promise((resolve) => setTimeout(resolve, 10_000))]);
     }
-    const features = getCachedFeatures();
+    const features = getCachedFeatures(config.destinationName);
     const clientVersion = server.getClientVersion();
     if (config.schemaNullableOptionals === 'auto' && !schemaNullableAutoClientInfoLogged) {
       schemaNullableAutoClientInfoLogged = true;
@@ -725,7 +740,7 @@ export function createServer(
     const isJwt = token && token.split('.').length === 3;
     if (config.ppEnabled && btpConfig && isJwt) {
       const ppUser = (extra.authInfo?.extra?.userName ?? extra.authInfo?.clientId) as string | undefined;
-      const ppDest = process.env.SAP_BTP_PP_DESTINATION ?? process.env.SAP_BTP_DESTINATION ?? '';
+      const ppDest = resolvePpDestinationName(config) ?? '';
       try {
         client = await createPerUserClient(config, btpConfig, btpProxy, token, adtSemaphore);
         isPerUserClient = true;
@@ -777,7 +792,7 @@ export function createServer(
     }
 
     // Inject startup discovery MIME map (shared for default and per-user clients).
-    client.http.setDiscoveryMap(getCachedDiscovery());
+    client.http.setDiscoveryMap(getCachedDiscovery(config.destinationName));
 
     // Per-request safety: merge server ceiling with per-user policy.
     //   - API-key path: clientId starts with "api-key:<profile>" — intersect server with profile's partial SafetyConfig.
@@ -796,7 +811,7 @@ export function createServer(
       const effectiveSafety = deriveUserSafety(client.safety, extra.authInfo.scopes);
       effectiveClient = client.withSafety(effectiveSafety);
     }
-    effectiveClient.http.setDiscoveryMap(getCachedDiscovery());
+    effectiveClient.http.setDiscoveryMap(getCachedDiscovery(config.destinationName));
 
     const result = await handleToolCall(
       effectiveClient,
@@ -824,7 +839,7 @@ export function createServer(
  * memory-cache or no-cache mode even when better-sqlite3 is not installed
  * (e.g. cross-platform deploys where native binaries were compiled elsewhere).
  */
-async function createCachingLayer(config: ServerConfig): Promise<CachingLayer | undefined> {
+export async function createCachingLayer(config: ServerConfig): Promise<CachingLayer | undefined> {
   const mode = config.cacheMode;
 
   if (mode === 'none') return undefined;
@@ -919,7 +934,12 @@ export async function createAndStartServer(
 
   // Pre-flight: warn clearly when no SAP connection is configured so users know
   // why all feature probes will fail (rather than seeing cryptic network errors).
-  const hasBtpConnection = !!(config.btpServiceKey || config.btpServiceKeyFile || process.env.SAP_BTP_DESTINATION);
+  const hasBtpConnection = !!(
+    config.btpServiceKey ||
+    config.btpServiceKeyFile ||
+    process.env.SAP_BTP_DESTINATION ||
+    process.env.SAP_BTP_DESTINATIONS
+  );
   if (!config.url && !hasBtpConnection) {
     logger.warn(
       'SAP_URL is not configured — no SAP system connection available. ' +
@@ -959,11 +979,53 @@ export async function createAndStartServer(
     });
   }
 
-  // Resolve BTP Destination if configured (overrides SAP_URL/USER/PASSWORD)
+  // ─── Multi-destination mode (SAP_BTP_DESTINATIONS) ────────────────
+  // One MCP endpoint per destination (/mcp/<name>); bare /mcp = default destination.
+  // Parsed here (not in resolveConfig) to mirror how SAP_BTP_DESTINATION is env-only.
+  const { parseDestinationsList } = await import('./destination-registry.js');
+  config.btpDestinations = parseDestinationsList(process.env.SAP_BTP_DESTINATIONS);
+  if (config.btpDestinations) {
+    if (config.btpServiceKey || config.btpServiceKeyFile) {
+      throw new Error(
+        'SAP_BTP_DESTINATIONS is incompatible with SAP_BTP_SERVICE_KEY — service-key mode connects to a single BTP ABAP system.',
+      );
+    }
+    if (config.cookieFile || config.cookieString) {
+      throw new Error(
+        'SAP_BTP_DESTINATIONS is incompatible with SAP_COOKIE_FILE / SAP_COOKIE_STRING — cookies authenticate a single system.',
+      );
+    }
+    if (process.env.SAP_BTP_DESTINATION && !config.btpDestinations.includes(process.env.SAP_BTP_DESTINATION)) {
+      throw new Error(
+        `SAP_BTP_DESTINATION '${process.env.SAP_BTP_DESTINATION}' must be one of SAP_BTP_DESTINATIONS ` +
+          `(${config.btpDestinations.join(', ')}) — it selects the default destination served at /mcp.`,
+      );
+    }
+    if (config.url) {
+      logger.warn('SAP_URL is ignored in multi-destination mode — connections come from the BTP destinations.');
+    }
+  }
+
+  // Resolve BTP Destination if configured (overrides SAP_URL/USER/PASSWORD).
+  // Skipped in multi-destination mode — the registry resolves per destination, lazily.
   let btpProxy: BTPProxyConfig | undefined;
   let btpConfig: BTPConfig | undefined;
   const btpDestination = process.env.SAP_BTP_DESTINATION;
-  if (btpDestination) {
+  if (config.btpDestinations) {
+    const { parseVCAPServices } = await import('@arc-mcp/xsuaa-auth/btp');
+    btpConfig = parseVCAPServices() ?? undefined;
+    if (!btpConfig) {
+      throw new Error(
+        'SAP_BTP_DESTINATIONS requires a Destination service binding (VCAP_SERVICES). ' +
+          'Bind a destination service instance (and a connectivity instance for on-premise destinations).',
+      );
+    }
+    logger.info('Multi-destination mode', {
+      destinations: config.btpDestinations,
+      default: btpDestination ?? config.btpDestinations[0],
+      ppEnabled: config.ppEnabled,
+    });
+  } else if (btpDestination) {
     const { resolveBTPDestination, parseVCAPServices } = await import('@arc-mcp/xsuaa-auth/btp');
     const resolved = await resolveBTPDestination(btpDestination, authLibLogger);
     config.url = resolved.url;
@@ -1008,8 +1070,34 @@ export async function createAndStartServer(
     disabled: config.rateLimit === 0,
   });
 
+  // ─── Multi-destination registry ────────────────────────────────────
+  // Lazily resolves destinations on first request; the DEFAULT destination is
+  // initialized eagerly so startup fails fast when the primary system's
+  // destination is missing or misconfigured (same contract as single-dest mode).
+  let registry: import('./destination-registry.js').DestinationRegistry | undefined;
+  let defaultRuntime: import('./destination-registry.js').DestinationRuntime | undefined;
+  if (config.btpDestinations && btpConfig) {
+    const { DestinationRegistry } = await import('./destination-registry.js');
+    const vcap = btpConfig;
+    registry = new DestinationRegistry({
+      baseConfig: config,
+      btpConfig: vcap,
+      names: config.btpDestinations,
+      createCachingLayer,
+      runStartupAuthPreflight: (cfg, proxy) => runStartupAuthPreflight(cfg, proxy, undefined, adtSemaphore),
+      runStartupProbe: (cfg, proxy) => runStartupProbe(cfg, proxy, undefined, vcap, adtSemaphore),
+      onProbeBlocked: (name) => {
+        setCachedFeatures(undefined, name);
+        setCachedDiscovery(new Map(), name);
+      },
+    });
+    const defaultName = process.env.SAP_BTP_DESTINATION ?? config.btpDestinations[0];
+    defaultRuntime = await registry.getRuntime(defaultName);
+  }
+
   // ─── Cache Setup ───────────────────────────────────────────────────
-  const cachingLayer = await createCachingLayer(config);
+  // Multi-destination mode: caches are per-destination, owned by the registry runtimes.
+  const cachingLayer = registry ? undefined : await createCachingLayer(config);
   if (cachingLayer) {
     const stats = cachingLayer.stats();
     logger.info('Object cache enabled', {
@@ -1021,6 +1109,9 @@ export async function createAndStartServer(
   }
 
   // Run warmup if configured (before starting transport so it completes before serving)
+  if (config.cacheWarmup && registry) {
+    logger.warn('ARC1_CACHE_WARMUP is not supported in multi-destination mode yet — skipping warmup.');
+  }
   if (config.cacheWarmup && cachingLayer && config.url) {
     try {
       const { runWarmup } = await import('../cache/warmup.js');
@@ -1051,54 +1142,76 @@ export async function createAndStartServer(
   // Run feature probe once at startup — shared across all requests (stdio and HTTP).
   // First run startup auth preflight in shared mode. If it blocks (401/403), skip feature probe
   // to avoid firing many failing requests with invalid technical credentials.
-  const startupAuthPreflightPromise = runStartupAuthPreflight(config, btpProxy, bearerTokenProvider, adtSemaphore);
-  const startupProbePromise = (async () => {
-    const authPreflight = await startupAuthPreflightPromise;
-    if (authPreflight.blocking) {
-      setCachedFeatures(undefined);
-      setCachedDiscovery(new Map());
-      return;
-    }
-    await runStartupProbe(config, btpProxy, bearerTokenProvider, btpConfig, adtSemaphore);
-  })();
+  // Multi-destination mode: the registry already owns per-destination preflight/probe;
+  // the default runtime's promises stand in for the global ones.
+  const startupAuthPreflightPromise = defaultRuntime
+    ? defaultRuntime.startupAuthPreflightPromise
+    : runStartupAuthPreflight(config, btpProxy, bearerTokenProvider, adtSemaphore);
+  const startupProbePromise = defaultRuntime
+    ? defaultRuntime.startupProbePromise
+    : (async () => {
+        const authPreflight = await startupAuthPreflightPromise;
+        if (authPreflight.blocking) {
+          setCachedFeatures(undefined);
+          setCachedDiscovery(new Map());
+          return;
+        }
+        await runStartupProbe(config, btpProxy, bearerTokenProvider, btpConfig, adtSemaphore);
+      })();
 
-  const server = createServer(
-    config,
-    btpProxy,
-    btpConfig,
-    bearerTokenProvider,
-    cachingLayer,
-    startupProbePromise,
-    startupAuthPreflightPromise,
-    adtSemaphore,
-    mcpRateLimiter,
-  );
+  // In multi-destination mode the "main" server serves the DEFAULT destination
+  // (bare /mcp and the stdio transport — back-compat rules in
+  // docs/multi-destination-evaluation.md §6.5).
+  const serverConfig = defaultRuntime?.config ?? config;
+  const serverProxy = defaultRuntime ? defaultRuntime.btpProxy : btpProxy;
+  const serverCachingLayer = defaultRuntime ? defaultRuntime.cachingLayer : cachingLayer;
+  const buildDefaultServer = () =>
+    createServer(
+      serverConfig,
+      serverProxy,
+      btpConfig,
+      bearerTokenProvider,
+      serverCachingLayer,
+      startupProbePromise,
+      startupAuthPreflightPromise,
+      adtSemaphore,
+      mcpRateLimiter,
+    );
+  const server = buildDefaultServer();
 
   const uiDeps: UiServerDeps | undefined =
     config.uiMode !== 'off'
       ? {
-          config,
+          config: serverConfig,
           sources: effectiveSources,
           version: VERSION,
           startedAt,
-          cachingLayer,
+          cachingLayer: serverCachingLayer,
           logBuffer: uiLogBuffer,
-          getFeatures: getCachedFeatures,
+          getFeatures: () => getCachedFeatures(serverConfig.destinationName),
         }
       : undefined;
 
   // Shutdown hook for SQLite cache cleanup (guard against double-close from multiple signals).
   // IMPORTANT: registering a SIGINT/SIGTERM listener suppresses Node's default exit behavior,
   // so we must call process.exit() explicitly after cleanup — otherwise Ctrl+C hangs the process.
-  if (cachingLayer) {
+  if (cachingLayer || registry) {
     let cacheClosed = false;
+    const registryRef = registry;
     const cleanup = (signal: string) => {
       if (cacheClosed) return;
       cacheClosed = true;
       try {
-        cachingLayer.cache.close();
+        cachingLayer?.cache.close();
       } catch {
         // Ignore close errors during shutdown
+      }
+      for (const runtime of registryRef?.resolvedRuntimes() ?? []) {
+        try {
+          runtime.cachingLayer?.cache.close();
+        } catch {
+          // Ignore close errors during shutdown
+        }
       }
       logger.info(`ARC-1 shutting down (${signal})`);
       process.exit(0);
@@ -1118,6 +1231,13 @@ export async function createAndStartServer(
   }
 
   if (config.transport === 'stdio') {
+    if (registry && config.btpDestinations && config.btpDestinations.length > 1) {
+      logger.warn(
+        'SAP_BTP_DESTINATIONS with stdio transport serves only the default destination — ' +
+          'per-destination endpoints (/mcp/<name>) require SAP_TRANSPORT=http-streamable.',
+        { serving: serverConfig.destinationName },
+      );
+    }
     if (uiDeps && config.uiMode === 'local') {
       await startLocalUiServer(uiDeps);
     }
@@ -1159,22 +1279,35 @@ export async function createAndStartServer(
     }
 
     const { startHttpServer } = await import('./http.js');
+    const registryRef = registry;
+    const multiDestinations =
+      registryRef && btpConfig
+        ? {
+            names: registryRef.names,
+            resolveFactory: async (name: string) => {
+              const runtime = await registryRef.getRuntime(name);
+              if (!runtime) return undefined;
+              return () =>
+                createServer(
+                  runtime.config,
+                  runtime.btpProxy,
+                  btpConfig,
+                  undefined,
+                  runtime.cachingLayer,
+                  runtime.startupProbePromise,
+                  runtime.startupAuthPreflightPromise,
+                  adtSemaphore,
+                  mcpRateLimiter,
+                );
+            },
+          }
+        : undefined;
     await startHttpServer(
-      () =>
-        createServer(
-          config,
-          btpProxy,
-          btpConfig,
-          bearerTokenProvider,
-          cachingLayer,
-          startupProbePromise,
-          startupAuthPreflightPromise,
-          adtSemaphore,
-          mcpRateLimiter,
-        ),
+      buildDefaultServer,
       config,
       xsuaaCredentials,
       config.uiMode === 'web' ? uiDeps : undefined,
+      multiDestinations,
     );
   }
 

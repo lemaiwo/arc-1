@@ -113,6 +113,14 @@ export interface ServerConfig {
   btpServiceKeyFile?: string; // Path to service key file
   btpOAuthCallbackPort: number; // Port for OAuth browser callback (0 = auto)
 
+  // --- Multi-destination mode (SAP_BTP_DESTINATIONS) ---
+  /** Destination allowlist parsed from SAP_BTP_DESTINATIONS (CSV). One MCP endpoint per name. */
+  btpDestinations?: string[];
+  /** Runtime-only: the destination this config instance is bound to (set by the registry, never parsed). */
+  destinationName?: string;
+  /** Runtime-only: PP destination override for this destination (`arc1.pp_destination` property). */
+  ppDestinationName?: string;
+
   // --- Principal Propagation (per-user SAP auth) ---
   ppEnabled: boolean;
   ppStrict: boolean; // If true, PP failure = error (no fallback to shared client)

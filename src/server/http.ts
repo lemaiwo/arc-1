@@ -153,6 +153,32 @@ export function applySecurityMiddleware(app: express.Application, allowedOrigins
 // ─── MCP Request Handler ─────────────────────────────────────────────
 
 /**
+ * Serve one MCP request with a fresh Server + Transport pair.
+ *
+ * IMPORTANT: Passes req.body as pre-parsed body (3rd argument).
+ * express.json() middleware consumes the raw request stream. Without this,
+ * the MCP SDK's transport tries to re-read the stream, gets nothing, and
+ * returns "Parse error: Invalid JSON" (-32700). The SDK explicitly supports
+ * this pattern — see their docs/comments in
+ * StreamableHTTPServerTransport.handleRequest().
+ */
+async function serveMcpRequest(serverFactory: () => McpServer, req: Request, res: Response): Promise<void> {
+  try {
+    const server = serverFactory();
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined, // Stateless mode
+    });
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (err) {
+    logger.error('MCP request error', { error: err instanceof Error ? err.message : String(err) });
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  }
+}
+
+/**
  * Create an Express handler that processes MCP requests.
  * Each request gets a fresh Server + Transport pair.
  */
@@ -165,25 +191,63 @@ function createMcpHandler(serverFactory: () => McpServer) {
       bodyMethod: req.body?.method,
       bodyId: req.body?.id,
     });
-    try {
-      const server = serverFactory();
-      const transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: undefined, // Stateless mode
+    await serveMcpRequest(serverFactory, req, res);
+  };
+}
+
+// ─── Multi-destination routing (SAP_BTP_DESTINATIONS) ────────────────
+
+/** Per-destination MCP routing: one endpoint per destination at /mcp/<name>. */
+export interface MultiDestinationRouting {
+  /** Destination allowlist — anything else on /mcp/:dest is a 404. */
+  names: string[];
+  /**
+   * Resolve the (lazily initialized) server factory for a destination.
+   * Returns undefined for unknown names; throws when initialization fails.
+   */
+  resolveFactory: (name: string) => Promise<(() => McpServer) | undefined>;
+}
+
+/**
+ * Create the Express handler for /mcp/:dest. Exported for unit testing.
+ *
+ * - Name not on the allowlist → 404 (deny by default).
+ * - Destination initialization failure → 502 with the reason; the registry does
+ *   not memoize failures, so a fixed destination recovers without a restart.
+ */
+export function createDestinationMcpHandler(multi: MultiDestinationRouting) {
+  return async (req: Request, res: Response) => {
+    const name = String((req.params as Record<string, string>).dest ?? '');
+    if (!multi.names.includes(name)) {
+      res.status(404).json({
+        error: `Unknown destination. Configured destinations: ${multi.names.join(', ')}.`,
       });
-      await server.connect(transport);
-      // IMPORTANT: Pass req.body as pre-parsed body (3rd argument).
-      // express.json() middleware (line 91) consumes the raw request stream.
-      // Without this, the MCP SDK's transport tries to re-read the stream,
-      // gets nothing, and returns "Parse error: Invalid JSON" (-32700).
-      // The SDK explicitly supports this pattern — see their docs/comments
-      // in StreamableHTTPServerTransport.handleRequest().
-      await transport.handleRequest(req, res, req.body);
-    } catch (err) {
-      logger.error('MCP request error', { error: err instanceof Error ? err.message : String(err) });
-      if (!res.headersSent) {
-        res.status(500).json({ error: 'Internal server error' });
-      }
+      return;
     }
+    let serverFactory: (() => McpServer) | undefined;
+    try {
+      serverFactory = await multi.resolveFactory(name);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error('Destination initialization failed', { destination: name, error: message });
+      res.status(502).json({
+        error: `Destination '${name}' failed to initialize: ${message}`,
+      });
+      return;
+    }
+    if (!serverFactory) {
+      res.status(404).json({
+        error: `Unknown destination. Configured destinations: ${multi.names.join(', ')}.`,
+      });
+      return;
+    }
+    logger.debug('MCP handler invoked (destination)', {
+      destination: name,
+      method: req.method,
+      bodyMethod: req.body?.method,
+      bodyId: req.body?.id,
+    });
+    await serveMcpRequest(serverFactory, req, res);
   };
 }
 
@@ -195,6 +259,7 @@ export async function startHttpServer(
   config: ServerConfig,
   xsuaaCredentials?: XsuaaCredentials,
   uiDeps?: UiServerDeps,
+  multiDestinations?: MultiDestinationRouting,
 ): Promise<void> {
   const [host, portStr] = config.httpAddr.split(':');
   const port = Number.parseInt(portStr || '8080', 10);
@@ -231,6 +296,7 @@ export async function startHttpServer(
   app.use(express.json());
   app.use(express.urlencoded({ extended: false }));
   const mcpHandler = createMcpHandler(serverFactory);
+  const destMcpHandler = multiDestinations ? createDestinationMcpHandler(multiDestinations) : undefined;
   const hasAdminApiKey = config.apiKeys?.some((entry) => entry.profile === 'admin') ?? false;
   if (uiDeps && !(hasAdminApiKey || config.oidcIssuer || (config.xsuaaAuth && xsuaaCredentials))) {
     throw new Error('ARC1_UI=web requires an admin API key, OIDC, or XSUAA HTTP authentication.');
@@ -541,6 +607,26 @@ export async function startHttpServer(
     }
     // Protected MCP endpoint with chained token verification
     app.all('/mcp', bearerAuth, mcpHandler);
+    if (destMcpHandler && multiDestinations) {
+      // Per-destination endpoints share the instance-wide bearer auth; the
+      // destination's own guardrail ceiling applies inside the tool handlers.
+      app.all('/mcp/:dest', bearerAuth, destMcpHandler);
+      // PRM alias per destination so PRM-aware clients pointed at /mcp/<dest>
+      // discover the same authorization server as /mcp.
+      app.get('/.well-known/oauth-protected-resource/mcp/:dest', (req, res) => {
+        const name = String((req.params as Record<string, string>).dest ?? '');
+        if (!multiDestinations.names.includes(name)) {
+          res.status(404).json({ error: 'Unknown destination' });
+          return;
+        }
+        res.json({
+          resource: `${oauthFullBase}/mcp/${name}`,
+          authorization_servers: [`${oauthFullBase}/`],
+          scopes_supported: scopesSupported,
+          resource_name: 'ARC-1 SAP MCP Server',
+        });
+      });
+    }
 
     logger.info('XSUAA OAuth proxy enabled', {
       xsappname: xsuaaCredentials.xsappname,
@@ -573,9 +659,15 @@ export async function startHttpServer(
         mountUiRoutes(app, uiDeps, uiBearerAuth);
       }
       app.all('/mcp', bearerAuth, mcpHandler);
+      if (destMcpHandler) {
+        app.all('/mcp/:dest', bearerAuth, destMcpHandler);
+      }
     } else {
       // No auth configured — open access
       app.all('/mcp', mcpHandler);
+      if (destMcpHandler) {
+        app.all('/mcp/:dest', destMcpHandler);
+      }
     }
   }
 
@@ -597,6 +689,9 @@ export async function startHttpServer(
       addr: `${bindHost}:${port}`,
       health: `http://${bindHost}:${port}/health`,
       mcp: `http://${bindHost}:${port}/mcp`,
+      destinations: multiDestinations
+        ? multiDestinations.names.map((n) => `http://${bindHost}:${port}/mcp/${n}`)
+        : undefined,
       ui: uiDeps ? `http://${bindHost}:${port}/ui/` : undefined,
       auth: authMode,
     });

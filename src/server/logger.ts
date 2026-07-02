@@ -85,7 +85,7 @@ export class Logger {
    */
   emitAudit(event: AuditEvent): void {
     let eventWithContext = event;
-    // Attach requestId from context if not already set
+    // Attach requestId + destination from context if not already set
     if (!event.requestId) {
       const ctx = getCurrentContext();
       if (ctx) {
@@ -93,6 +93,7 @@ export class Logger {
           ...event,
           requestId: ctx.requestId,
           ...(!event.user && ctx.user ? { user: ctx.user } : {}),
+          ...(!event.destination && ctx.destination ? { destination: ctx.destination } : {}),
         };
       }
     }

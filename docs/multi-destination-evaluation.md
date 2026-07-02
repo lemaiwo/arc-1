@@ -1,6 +1,7 @@
 # Evaluation: Multiple BTP Destinations in One ARC-1 Instance
 
 **Date:** 2026-07-02
+**Status:** Implemented (work items 1–5, 7 + PP per destination) — see `docs_page/multi-destination.md` for the user guide. Deferred: per-destination warmup (item 9), destination-scoped API keys (item 11), attribute-based XSUAA roles (item 12).
 **Fork state:** `lemaiwo/arc-1` main = v0.4.4 (last synced ~2026-04-08)
 **Upstream state:** v0.9.24 (published 2026-07-01), repo moved to `arc-mcp/arc-1`
 
