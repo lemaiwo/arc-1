@@ -85,7 +85,7 @@ Both in the fork (0.4.4) and upstream (0.9.24):
 ### Option A — Path-per-destination endpoints (recommended)
 
 ```
-ARC1_DESTINATIONS='{"S4D":{...},"S4Q":{...},"S4P":{}}'   # allowlist + per-system policy (§6.4)
+SAP_BTP_DESTINATIONS=S4D,S4Q,S4P   # allowlist; per-system guardrails live on the destinations (§6.4)
 
 https://arc1.cfapps.../mcp/S4D   → dev system
 https://arc1.cfapps.../mcp/S4Q   → qa system
@@ -143,7 +143,7 @@ maintain. This is the pragmatic stopgap until Option A exists.
 
 | # | Item | Where (0.9.x layout) | Size |
 |---|------|----------------------|------|
-| 1 | `ARC1_DESTINATIONS` JSON policy map — keys = destination allowlist, values = per-system guardrail ceiling; startup validation, back-compat with single-dest mode (see §6.4) | `server/config.ts` | S |
+| 1 | `SAP_BTP_DESTINATIONS` CSV allowlist + parse `arc1.*` destination properties into a per-system policy, intersected with the global `SAP_ALLOW_*` ceiling; startup validation, single-dest back-compat (see §6.4) | `server/config.ts`, registry | S–M |
 | 2 | `DestinationRegistry` with lazy init + credential re-resolution on 401/TTL (startup-once resolution is already a latent staleness bug for long-running instances) | new `server/destination-registry.ts`, reuse `@arc-mcp/xsuaa-auth` | M |
 | 3 | Feature cache + discovery map keyed by destination (currently module-global in `handlers/feature-cache.ts`) | `handlers/feature-cache.ts`, `server/server.ts` | S–M |
 | 4 | Cache isolation: per-destination cache file (`.arc1-cache-<dest>.db`) **or** a `system` column/key prefix. Separate files are simpler and make eviction trivial | `cache/*` | M |
@@ -213,16 +213,19 @@ setup, so real SAP authorizations (S_DEVELOP etc.) apply per user, per system.
 
 Split of responsibilities in the multi-destination setup:
 
-**Lives in each BTP destination** (this is already how `SAP_BTP_DESTINATION` works today):
-- `URL`, auth (`User`/`Password` for BasicAuth, or `PrincipalPropagation` type)
+**Lives in each BTP destination:**
+- `URL`, auth (`User`/`Password` for BasicAuth, or `PrincipalPropagation` type) —
+  this is already how `SAP_BTP_DESTINATION` works today
 - `ProxyType` (`OnPremise` → Cloud Connector, incl. `CloudConnectorLocationId`)
 - `sap-client` as an **additional property** — ARC-1 already reads it
   (`resolveBTPDestination`, defaults to `100` when absent)
+- The system's guardrails, as `arc1.*` additional properties (see §6.4)
 
 **Stays in `mta.yaml` / `mtaext`:**
 - Service bindings (destination, connectivity, xsuaa services)
-- The destination policy map `ARC1_DESTINATIONS` (allowlist + per-system guardrails,
-  see §6.4)
+- The destination allowlist `SAP_BTP_DESTINATIONS=S4D,S4Q,S4P` (plain CSV)
+- The instance-wide guardrail **ceiling** — the existing global `SAP_ALLOW_*` /
+  `SAP_ALLOWED_PACKAGES` / `SAP_DENY_ACTIONS` vars, unchanged (see §6.4)
 
 **System ID: nothing to configure.** The destination *name* is the identifier used for
 routing (`/mcp/S4D`), cache scoping, audit, and role checks — no SID property is
@@ -230,11 +233,6 @@ needed. System type and capabilities (BTP vs on-prem, textSearch, …) are probe
 automatically per destination via ADT discovery on first use. Only `sap-client` must
 be set as a destination property if the client isn't 100.
 
-Guardrails *could* alternatively be stored as custom destination properties (e.g.
-`arc1.allow_writes=true` — the Destination Service returns arbitrary properties).
-Deliberately **not** recommended as the source of truth: anyone with destination-admin
-rights in the subaccount could then widen write access without a redeploy. If used at
-all, env vars should remain the ceiling and destination properties may only narrow.
 
 ### 6.2 Cross-system calls
 
@@ -257,7 +255,7 @@ defer unless a concrete need appears.
 Today the XSUAA scopes (`read`, `write`, `data`, `sql`, `transports`, `git`,
 `admin`) are instance-wide. Two ways to make BTP role collections per system:
 
-1. **Scope-per-destination (recommended, simple):** declare
+1. **Scope-per-destination (static):** declare
    `$XSAPPNAME.S4D.write`, `$XSAPPNAME.S4P.read`, … in `xs-security.json`
    (generated from the destination list at deploy time), with role templates per
    system. BTP admins then assign role collections like *ARC1 Developer (S4D)* /
@@ -315,54 +313,67 @@ Caveat: user attributes exist only on user tokens (authorization-code flow). Tok
 from client-credentials flows and plain API keys carry no attributes — those callers
 are scoped via destination-scoped API keys (work item 11) instead.
 
-### 6.4 Configuring per-system guardrails (mtaext)
+### 6.4 Configuring per-system guardrails
 
-Today (one system) the guardrails sit as env properties in the MTA extension
-descriptor. That stays the pattern — but instead of one env var per flag per system
-(`SAP_ALLOW_WRITES_S4D`, `SAP_ALLOWED_PACKAGES_S4D`, … — 8 flags × N systems of
-string-typed vars), the design uses **one JSON policy map, `ARC1_DESTINATIONS`**,
-whose keys double as the destination allowlist:
+Today (one system) the guardrails are env properties in the MTA extension descriptor.
+With multiple systems, per-flag env vars would multiply (8 flags × N systems) and a
+JSON-blob env var is hard to read and diff. Instead, per-system guardrails move to
+where the system itself is defined: **`arc1.*` additional properties on each BTP
+destination**, right next to `sap-client`. The mtaext keeps only what is instance-wide.
+
+**In the BTP cockpit, per destination** (additional properties, flat key=value):
+
+```
+# Destination S4D
+sap-client              200
+arc1.allow_writes       true
+arc1.allow_transports   true
+arc1.allow_git          true
+arc1.allowed_packages   ZTEAM*,ZCOMMON
+
+# Destination S4P — no arc1.* properties → fully read-only (deny by default)
+sap-client              100
+arc1.deny_actions       SAPQuery.*
+```
+
+**In the mtaext, instance-wide** (unchanged vars from today):
 
 ```yaml
-# arc-1.mtaext — today (single system)
+# arc-1.mtaext
 modules:
   - name: arc-1-srv
     properties:
-      SAP_BTP_DESTINATION: S4D
-      SAP_ALLOW_WRITES: true
-      SAP_ALLOWED_PACKAGES: "ZTEAM*"
+      SAP_BTP_DESTINATIONS: S4D,S4Q,S4P   # plain CSV allowlist
+      SAP_ALLOW_WRITES: true               # global ceiling: writes may exist at all
+      SAP_ALLOW_TRANSPORT_WRITES: true
+      SAP_ALLOW_GIT_WRITES: true
+      SAP_ALLOW_DATA_PREVIEW: true
+      # SAP_ALLOW_FREE_SQL not set → free SQL impossible on every system
 ```
 
-```yaml
-# arc-1.mtaext — multi-destination
-modules:
-  - name: arc-1-srv
-    properties:
-      ARC1_DESTINATIONS: >-
-        {
-          "S4D": { "allowWrites": true, "allowTransportWrites": true,
-                   "allowGitWrites": true, "allowedPackages": ["ZTEAM*"] },
-          "S4Q": { "allowDataPreview": true },
-          "S4P": { "denyActions": ["SAPQuery.*"] }
-        }
-```
+Semantics — the same intersection model the codebase already uses everywhere:
 
-Semantics:
+**effective rights = global ceiling (mtaext) ∩ destination `arc1.*` properties ∩ caller profile/scopes**
 
-- **Keys = allowlist.** Only listed destinations get an endpoint; everything else 404s.
-  (No separate `SAP_BTP_DESTINATIONS` var needed.)
-- **Deny by default.** A flag not present is `false` — `"S4P": {}` would be a valid,
-  fully read-only prod entry. This matches the positive-opt-in philosophy of the 0.7
-  authz refactor, and means typos fail closed.
-- **Validation at startup.** Unknown destination names (not resolvable in the
-  Destination Service) and unknown policy keys abort startup with a clear error —
-  same hard-fail approach upstream uses for legacy env vars.
-- **Back-compat.** Single-system mode (`SAP_BTP_DESTINATION` + global `SAP_ALLOW_*`)
-  keeps working unchanged; setting both it and `ARC1_DESTINATIONS` is a startup error.
-- Per-caller narrowing (API-key profiles / scopes) then intersects with the
-  destination's policy exactly as today — the JSON map is the per-system *ceiling*.
-
-## 7. Recommended path
+- **Deny by default.** An `arc1.*` property that is absent means `false` — a
+  destination with no `arc1.*` properties is read-only. Typos fail closed.
+- **The mtaext stays the security ceiling.** Destination properties can only *enable
+  up to* what the global `SAP_ALLOW_*` vars permit, never beyond. A destination admin
+  can open writes on a dev system but can never grant free SQL if the deployment
+  doesn’t allow it — this answers the “destination admins could widen access” concern.
+- **Optional deploy-time pin.** For systems where cockpit-side changes must not matter
+  at all (prod), an env override wins over destination properties:
+  `SAP_PIN_S4P: read-only`. Coarse and rare on purpose — one line, only where needed.
+- **Cockpit-managed lifecycle.** Adding a system = create destination (+ its `arc1.*`
+  properties) + add its name to the CSV + assign role collections. Tightening or
+  loosening a dev system’s guardrails needs no redeploy — ARC-1 re-reads destination
+  properties when it (re-)resolves the destination (registry TTL / 401 re-resolution,
+  work item 2).
+- **Auditability.** ARC-1 logs each destination’s effective policy at startup and on
+  re-resolution (upstream already has an effective-policy log), so cockpit-side
+  changes are visible in the app log, not silent.
+- **Back-compat.** Single-system mode (`SAP_BTP_DESTINATION` + global `SAP_ALLOW_*`
+  as the direct config) keeps working unchanged.
 
 ## 7. Recommended path
 
