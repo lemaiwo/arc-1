@@ -23,6 +23,7 @@ import {
   getConfiguredToolDefinitions,
   logAuthSummary,
   resolveNullableOptionals,
+  resolvePpDestinationName,
   runStartupAuthPreflight,
   VERSION,
 } from '../../../src/server/server.js';
@@ -784,5 +785,27 @@ describe('startup auth preflight', () => {
     } finally {
       fixture.cleanup();
     }
+  });
+});
+
+describe('resolvePpDestinationName', () => {
+  afterEach(() => {
+    delete process.env.SAP_BTP_PP_DESTINATION;
+    delete process.env.SAP_BTP_DESTINATION;
+  });
+
+  it('single-destination mode: SAP_BTP_PP_DESTINATION wins, SAP_BTP_DESTINATION is the fallback', () => {
+    expect(resolvePpDestinationName(DEFAULT_CONFIG)).toBeUndefined();
+    process.env.SAP_BTP_DESTINATION = 'S4_SHARED';
+    expect(resolvePpDestinationName(DEFAULT_CONFIG)).toBe('S4_SHARED');
+    process.env.SAP_BTP_PP_DESTINATION = 'S4_PP';
+    expect(resolvePpDestinationName(DEFAULT_CONFIG)).toBe('S4_PP');
+  });
+
+  it('multi-destination mode: arc1.pp_destination wins, then the destination itself — global env vars never leak in', () => {
+    process.env.SAP_BTP_PP_DESTINATION = 'GLOBAL_PP';
+    const cfg = { ...DEFAULT_CONFIG, destinationName: 'S4D' };
+    expect(resolvePpDestinationName(cfg)).toBe('S4D');
+    expect(resolvePpDestinationName({ ...cfg, ppDestinationName: 'S4D_PP' })).toBe('S4D_PP');
   });
 });

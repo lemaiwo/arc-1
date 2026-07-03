@@ -105,9 +105,11 @@ Full reference: [btp-abap-environment.md](btp-abap-environment.md).
 | Env var | Effect |
 |---|---|
 | `SAP_BTP_DESTINATION` | Name of the BTP Destination ARC-1 reads to obtain SAP URL + auth details. For BasicAuth destinations this creates the shared technical client. For BTP ABAP `OAuth2UserTokenExchange` destinations, this can also be the per-user destination used when `SAP_PP_ENABLED=true`. Bypasses `SAP_URL` / `SAP_USER` / `SAP_PASSWORD` — those are ignored when a destination is set. |
-| `SAP_BTP_PP_DESTINATION` | Optional separate per-user destination name. Use this for on-premise `PrincipalPropagation` when shared startup traffic and per-user traffic must route via different destinations. If unset, ARC-1 falls back to `SAP_BTP_DESTINATION`. |
+| `SAP_BTP_PP_DESTINATION` | Optional separate per-user destination name. Use this for on-premise `PrincipalPropagation` when shared startup traffic and per-user traffic must route via different destinations. If unset, ARC-1 falls back to `SAP_BTP_DESTINATION`. Not used in multi-destination mode (see below). |
+| `SAP_BTP_DESTINATIONS` | Multi-destination mode: CSV allowlist of destination names — one MCP endpoint per name at `/mcp/<name>`, bare `/mcp` serves the default (`SAP_BTP_DESTINATION` if set, else the first entry). Guardrails narrow per system via `arc1.*` destination properties and `SAP_*_<DEST>` env pins. HTTP transport only. See [multi-destination.md](multi-destination.md). |
+| `SAP_ALLOW_WRITES_<DEST>`, `SAP_ALLOW_DATA_PREVIEW_<DEST>`, `SAP_ALLOW_FREE_SQL_<DEST>`, `SAP_ALLOW_TRANSPORT_WRITES_<DEST>`, `SAP_ALLOW_GIT_WRITES_<DEST>`, `SAP_ALLOWED_PACKAGES_<DEST>`, `SAP_ALLOWED_TRANSPORTS_<DEST>`, `SAP_DENY_ACTIONS_<DEST>` | Multi-destination mode: deploy-time per-system pins. Intersect with (never widen) the global baseline and the destination's `arc1.*` properties. `<DEST>` = destination name uppercased with `-` → `_`. |
 
-Full reference: [btp-destination-setup.md](btp-destination-setup.md).
+Full reference: [btp-destination-setup.md](btp-destination-setup.md) · [multi-destination.md](multi-destination.md).
 
 #### B5. Principal Propagation
 

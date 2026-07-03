@@ -13,6 +13,8 @@ export interface RequestContext {
   requestId: string;
   user?: string;
   tool?: string;
+  /** Multi-destination mode: name of the BTP destination this request is bound to. */
+  destination?: string;
 }
 
 export const requestContext = new AsyncLocalStorage<RequestContext>();

@@ -76,6 +76,7 @@ Full per-option details (defaults, clamps, layer interactions): [docs_page/confi
 | `ARC1_MAX_CONCURRENT` | Server-wide SAP request cap (default 10); size vs `rdisp/wp_no_dia` |
 | `ARC1_AUTH_RATE_LIMIT` / `ARC1_RATE_LIMIT` | Layer 1 per-IP OAuth cap (20/min) / Layer 2 per-user MCP cap (default 0 = off; ADR-0004) |
 | `SAP_BTP_DESTINATION` / `SAP_BTP_PP_DESTINATION` | BTP Destination names (PP = PrincipalPropagation type) |
+| `SAP_BTP_DESTINATIONS` | Multi-destination mode: CSV allowlist → one MCP endpoint per name (`/mcp/<name>`); guardrails narrow per system via `arc1.*` destination properties + `SAP_*_<DEST>` env pins (never widen) |
 | `SAP_PP_ENABLED` / `SAP_PP_STRICT` / `SAP_PP_ALLOW_SHARED_COOKIES` | Principal propagation + strict mode + cookie-coexistence escape hatch |
 | `SAP_DISABLE_SAML` | Disable SAML redirect — never on BTP ABAP / S/4 Public Cloud |
 | `ARC1_PROFILE` | Safety profile shortcut (viewer…developer-sql) |
@@ -92,7 +93,8 @@ src/
 ├── server/
 │   ├── server.ts               # MCP server setup, tool registration
 │   ├── config.ts, types.ts     # Config parser + ServerConfig defaults
-│   ├── http.ts                 # HTTP Streamable transport + auth chain
+│   ├── http.ts                 # HTTP Streamable transport + auth chain + /mcp/<dest> routing
+│   ├── destination-registry.ts # Multi-destination mode: lazy per-destination runtimes + arc1.* guardrail narrowing
 │   ├── logger.ts               # Structured logger (stderr only, never stdout)
 │   ├── audit.ts, sinks/        # Audit events + stderr/file/btp-auditlog sinks
 │   ├── context.ts, elicit.ts   # MCP context helpers, elicitation
@@ -107,7 +109,7 @@ src/
 │   ├── write-helpers.ts        # buildCreateXml, pre-write gates, server-driven write engine, package enforcement
 │   ├── cds-hints.ts            # CDS dependency/impact hints + reserved-keyword guard
 │   ├── tool-registry.ts        # SINGLE SOURCE of per-tool type tables ({type,btp} rows → derived ONPREM/BTP arrays)
-│   ├── feature-cache.ts        # cached ADT discovery + resolved features (live bindings)
+│   ├── feature-cache.ts        # cached ADT discovery + resolved features, keyed by destination (ALS fallback)
 │   ├── cache-security.ts       # per-user cache isolation under principal propagation
 │   ├── shared.ts               # ToolResult + textResult/errorResult
 │   ├── tools.ts                # Tool definitions (JSON Schema the LLM sees)
@@ -143,6 +145,7 @@ Terse routing only — full gotchas per row in [docs/dev-guide.md](docs/dev-guid
 
 | Task | Files (+ key gotcha) |
 |------|------|
+| Multi-destination mode (SAP_BTP_DESTINATIONS) | `src/server/destination-registry.ts` (allowlist, arc1.* policy narrowing, lazy runtimes), `src/server/server.ts` (createAndStartServer wiring), `src/server/http.ts` (`/mcp/:dest`), `src/handlers/feature-cache.ts` (destination-keyed) — guardrails are narrowing-only vs the env baseline; docs_page/multi-destination.md |
 | Add new read operation | `src/adt/client.ts`, `src/handlers/read.ts`, `src/handlers/tools.ts` (+ `src/adt/xml-parser.ts`, `src/adt/types.ts` for structured) |
 | Add ADT slash alias to `SLASH_TYPE_MAP` | `src/handlers/object-types.ts`, `tests/unit/handlers/slash-type-map.test.ts` — needs `docs/research/abap-types/types/<short>.md` evidence, verify live `<adtcore:type>` first (#218) |
 | SAPWrite TABL subtype routing (TABL/DT vs /DS, #285) | `src/handlers/object-types.ts`, `src/handlers/write-helpers.ts`, `src/handlers/write/create.ts`, `src/handlers/{schemas,tools}.ts` — reads collapse to bare `TABL` |

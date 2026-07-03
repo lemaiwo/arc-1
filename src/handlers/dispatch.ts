@@ -34,7 +34,7 @@ import { handleSAPActivate } from './activate.js';
 import { buildCacheSecurityContext } from './cache-security.js';
 import { handleSAPContext } from './context.js';
 import { handleSAPDiagnose } from './diagnose.js';
-import { cachedFeatures } from './feature-cache.js';
+import { getCachedFeatures } from './feature-cache.js';
 import { handleSAPGit } from './git.js';
 import { expandHyperfocusedArgs } from './hyperfocused.js';
 import { handleSAPLint } from './lint.js';
@@ -136,7 +136,7 @@ function buildBaseErrorMessage(
     // Pass the detected SAP_BASIS release so the 423 lock-handle hint can specialize
     // (< 7.51 → point at abapfs_extensions; see issue #293). cachedFeatures is set by the
     // startup probe; config.abapRelease is the manual SAP_ABAP_RELEASE override fallback.
-    const abapRelease = cachedFeatures?.abapRelease ?? config.abapRelease;
+    const abapRelease = getCachedFeatures()?.abapRelease ?? config.abapRelease;
     const classification = classifySapDomainError(err.statusCode, err.responseBody, err.path, abapRelease);
 
     if (classification) {
@@ -550,6 +550,7 @@ export async function handleToolCall(
     timestamp: new Date().toISOString(),
     level: 'info',
     event: 'tool_call_start',
+    destination: config.destinationName,
     requestId: reqId,
     user,
     clientId,
@@ -706,80 +707,85 @@ export async function handleToolCall(
   }
 
   // Run within request context so HTTP-level logs get the requestId
-  return requestContext.run({ requestId: reqId, user, tool: toolName }, async () => {
-    try {
-      const cacheSecurity = buildCacheSecurityContext(authInfo, isPerUserClient);
+  return requestContext.run(
+    { requestId: reqId, user, tool: toolName, destination: config.destinationName },
+    async () => {
+      try {
+        const cacheSecurity = buildCacheSecurityContext(authInfo, isPerUserClient);
 
-      // FEAT-61: inner dispatch is owned by the ToolRegistry (built-ins + plugin Custom_* tools).
-      // The shared pipeline above (rate-limit, scope, deny, Zod, audit) is unchanged; the registry
-      // only replaces the former `switch (toolName)`. See extension-framework-spec.md §4.
-      const entry = getToolRegistry().get(toolName);
-      let result: ToolResult;
-      // Plugin (Custom_*) tools are out of scope for hyperfocused mode (spec §1): hidden from
-      // tools/list AND not directly invocable, so a client that knows a Custom_ name can't reach a
-      // plugin tool here either. Built-ins (incl. the `SAP` wrapper) dispatch normally.
-      if (!entry || (config.toolMode === 'hyperfocused' && entry.source === 'plugin')) {
-        result = errorResult(`Unknown tool: ${toolName}`);
-      } else {
-        const dispatchCtx: ToolDispatchContext = {
-          client,
-          config,
-          args,
-          cache: cachingLayer,
-          authInfo,
-          isPerUserClient,
-          cacheSecurity,
-          server: _server,
+        // FEAT-61: inner dispatch is owned by the ToolRegistry (built-ins + plugin Custom_* tools).
+        // The shared pipeline above (rate-limit, scope, deny, Zod, audit) is unchanged; the registry
+        // only replaces the former `switch (toolName)`. See extension-framework-spec.md §4.
+        const entry = getToolRegistry().get(toolName);
+        let result: ToolResult;
+        // Plugin (Custom_*) tools are out of scope for hyperfocused mode (spec §1): hidden from
+        // tools/list AND not directly invocable, so a client that knows a Custom_ name can't reach a
+        // plugin tool here either. Built-ins (incl. the `SAP` wrapper) dispatch normally.
+        if (!entry || (config.toolMode === 'hyperfocused' && entry.source === 'plugin')) {
+          result = errorResult(`Unknown tool: ${toolName}`);
+        } else {
+          const dispatchCtx: ToolDispatchContext = {
+            client,
+            config,
+            args,
+            cache: cachingLayer,
+            authInfo,
+            isPerUserClient,
+            cacheSecurity,
+            server: _server,
+            requestId: reqId,
+          };
+          result = await entry.invoke(dispatchCtx);
+        }
+
+        const durationMs = Date.now() - start;
+        const fullText = result.content.map((c) => c.text).join('');
+        const resultSize = fullText.length;
+        const resultPreview = buildAuditResultPreview(toolName, args, fullText);
+
+        logger.emitAudit({
+          timestamp: new Date().toISOString(),
+          level: result.isError ? 'error' : 'info',
+          event: 'tool_call_end',
+          destination: config.destinationName,
           requestId: reqId,
-        };
-        result = await entry.invoke(dispatchCtx);
+          user,
+          clientId,
+          tool: toolName,
+          pluginName,
+          durationMs,
+          status: result.isError ? 'error' : 'success',
+          errorMessage: result.isError ? result.content[0]?.text : undefined,
+          errorClass: result.isError ? 'result-path' : undefined,
+          resultSize,
+          resultPreview,
+        });
+
+        return result;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        const durationMs = Date.now() - start;
+
+        logger.emitAudit({
+          timestamp: new Date().toISOString(),
+          level: 'error',
+          event: 'tool_call_end',
+          destination: config.destinationName,
+          requestId: reqId,
+          user,
+          clientId,
+          tool: toolName,
+          pluginName,
+          durationMs,
+          status: 'error',
+          errorClass: classifyError(err),
+          errorMessage: message,
+        });
+
+        return errorResult(formatErrorForLLM(err, message, toolName, args, config));
       }
-
-      const durationMs = Date.now() - start;
-      const fullText = result.content.map((c) => c.text).join('');
-      const resultSize = fullText.length;
-      const resultPreview = buildAuditResultPreview(toolName, args, fullText);
-
-      logger.emitAudit({
-        timestamp: new Date().toISOString(),
-        level: result.isError ? 'error' : 'info',
-        event: 'tool_call_end',
-        requestId: reqId,
-        user,
-        clientId,
-        tool: toolName,
-        pluginName,
-        durationMs,
-        status: result.isError ? 'error' : 'success',
-        errorMessage: result.isError ? result.content[0]?.text : undefined,
-        errorClass: result.isError ? 'result-path' : undefined,
-        resultSize,
-        resultPreview,
-      });
-
-      return result;
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      const durationMs = Date.now() - start;
-
-      logger.emitAudit({
-        timestamp: new Date().toISOString(),
-        level: 'error',
-        event: 'tool_call_end',
-        requestId: reqId,
-        user,
-        clientId,
-        tool: toolName,
-        pluginName,
-        durationMs,
-        status: 'error',
-        errorClass: classifyError(err),
-        errorMessage: message,
-      });
-
-      return errorResult(formatErrorForLLM(err, message, toolName, args, config));
-    }
-  });
+    },
+  );
 }
 
 // ─── Individual Tool Handlers ────────────────────────────────────────
